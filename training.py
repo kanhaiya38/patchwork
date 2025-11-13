@@ -1,0 +1,507 @@
+"""
+LoRA Continual Learning Training with Auto-Resume
+
+This script handles continual learning with automatic checkpoint detection and resume.
+It automatically detects the last successful checkpoint and resumes training from there.
+
+Usage:
+    # Auto-resume from last checkpoint (default)
+    python training.py
+
+    # Start fresh (ignore existing checkpoints)
+    python training.py --no-resume
+
+    # Custom configuration
+    python training.py --output-dir ./my-checkpoints --batch-size 16
+"""
+
+import argparse
+import logging
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import torch
+from datasets import load_dataset
+from peft import PeftModel, LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    TrainingArguments,
+    Trainer,
+    DataCollatorForLanguageModeling,
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('training.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Task:
+    """Represents a training task in the continual learning sequence."""
+    dataset_name: str
+    num_epochs: int
+
+    def __str__(self) -> str:
+        return f"{self.dataset_name} ({self.num_epochs} epochs)"
+
+
+class ContinualLearningTrainer:
+    """Handles continual learning with automatic checkpoint detection and resume."""
+
+    def __init__(
+        self,
+        base_model_name: str = "openlm-research/open_llama_3b_v2",
+        output_dir: str = "./lora-continual",
+        training_output_dir: str = "./lora-output",
+        data_dir: str = "TRACE-Benchmark/LLM-CL-Benchmark_500",
+        max_length: int = 512,
+        batch_size: int = 32,
+        learning_rate: float = 5e-5,
+    ):
+        """
+        Initialize the continual learning trainer.
+
+        Args:
+            base_model_name: HuggingFace model identifier
+            output_dir: Directory to save task checkpoints
+            training_output_dir: Directory for training artifacts
+            data_dir: Root directory for datasets
+            max_length: Maximum sequence length for tokenization
+            batch_size: Training batch size
+            learning_rate: Learning rate
+        """
+        self.base_model_name = base_model_name
+        self.output_dir = Path(output_dir)
+        self.training_output_dir = Path(training_output_dir)
+        self.data_dir = Path(data_dir)
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+
+        self.model: Optional[PeftModel] = None
+        self.tokenizer: Optional[AutoTokenizer] = None
+
+        # Create output directories
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.training_output_dir.mkdir(parents=True, exist_ok=True)
+
+    def find_last_checkpoint(self, tasks: List[Task]) -> Tuple[Optional[int], Optional[Path]]:
+        """
+        Find the last successful checkpoint.
+
+        Args:
+            tasks: List of Task objects
+
+        Returns:
+            Tuple of (last_completed_task_id, checkpoint_path) or (None, None) if no checkpoint found
+        """
+        logger.info("Searching for existing checkpoints...")
+
+        for task_id in range(len(tasks) - 1, -1, -1):
+            task = tasks[task_id]
+            checkpoint_path = self.output_dir / f"task_{task_id}_{task.dataset_name}"
+
+            if checkpoint_path.exists() and (checkpoint_path / "adapter_config.json").exists():
+                logger.info(f"Found checkpoint: {checkpoint_path}")
+                return task_id, checkpoint_path
+
+        logger.info("No existing checkpoints found")
+        return None, None
+
+    def setup_model_and_tokenizer(
+        self,
+        checkpoint_path: Optional[Path] = None,
+        use_quantization: bool = True
+    ) -> None:
+        """
+        Load model and tokenizer, optionally from a checkpoint.
+
+        Args:
+            checkpoint_path: Path to LoRA checkpoint to resume from
+            use_quantization: Whether to use 4-bit quantization
+        """
+        logger.info("Setting up model and tokenizer...")
+
+        # Configure quantization
+        bnb_config = None
+        if use_quantization:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+
+        # Load tokenizer
+        logger.info(f"Loading tokenizer from {self.base_model_name}")
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.base_model_name,
+            use_fast=False
+        )
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+        self.tokenizer = tokenizer
+
+        # Load base model
+        logger.info(f"Loading base model from {self.base_model_name}")
+        base_model = AutoModelForCausalLM.from_pretrained(
+            self.base_model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+
+        # Load from checkpoint or prepare new model
+        if checkpoint_path:
+            logger.info(f"Loading LoRA checkpoint from {checkpoint_path}")
+            model = PeftModel.from_pretrained(base_model, str(checkpoint_path))
+            # Ensure model is in training mode and gradients are enabled
+            model.train()
+            # Enable gradient checkpointing if using quantization
+            if use_quantization:
+                model.enable_input_require_grads()
+        else:
+            logger.info("Preparing new LoRA model from scratch...")
+            base_model = prepare_model_for_kbit_training(base_model)
+
+            lora_config = LoraConfig(
+                r=8,
+                lora_alpha=16,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                lora_dropout=0.05,
+                bias="none",
+                task_type="CAUSAL_LM"
+            )
+
+            model = get_peft_model(base_model, lora_config)
+
+        model.print_trainable_parameters()
+        self.model = model
+        logger.info("Model and tokenizer setup complete")
+
+    def get_tokenized_dataset(self, dataset_name: str):
+        """
+        Load and tokenize dataset (same logic as notebook).
+
+        Args:
+            dataset_name: Name of the dataset subdirectory
+
+        Returns:
+            Tokenized dataset ready for training
+        """
+        assert self.tokenizer is not None, "Tokenizer not initialized. Call setup_model_and_tokenizer first."
+
+        logger.info(f"Loading dataset: {dataset_name}")
+
+        dataset = load_dataset(
+            "json",
+            data_files={
+                "train": str(self.data_dir / dataset_name / "train.json"),
+                "test": str(self.data_dir / dataset_name / "test.json"),
+                "eval": str(self.data_dir / dataset_name / "eval.json"),
+            },
+        )
+
+        def format_instruction(examples):
+            texts = [
+                prompt + answer
+                for prompt, answer in zip(examples["prompt"], examples["answer"])
+            ]
+            return {"text": texts}
+
+        logger.info(f"Formatting dataset: {dataset_name}")
+        formatted_dataset = dataset.map(
+            format_instruction,
+            batched=True,
+            remove_columns=["prompt", "answer"]
+        )
+
+        def tokenize_function(examples):
+            assert self.tokenizer is not None
+            return self.tokenizer(
+                examples["text"],
+                truncation=True,
+                max_length=self.max_length
+            )
+
+        logger.info(f"Tokenizing dataset: {dataset_name}")
+        tokenized_dataset = formatted_dataset.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=["text"]
+        )
+
+        logger.info(f"Dataset {dataset_name} prepared successfully")
+        return tokenized_dataset
+
+    def train_model(self, tokenized_dataset, num_epochs: int) -> None:
+        """
+        Train the model on a dataset.
+
+        Args:
+            tokenized_dataset: Preprocessed dataset
+            num_epochs: Number of training epochs
+        """
+        assert self.model is not None, "Model not initialized. Call setup_model_and_tokenizer first."
+        assert self.tokenizer is not None, "Tokenizer not initialized. Call setup_model_and_tokenizer first."
+
+        logger.info(f"Starting training for {num_epochs} epochs...")
+
+        training_args = TrainingArguments(
+            output_dir=str(self.training_output_dir),
+            per_device_train_batch_size=self.batch_size,
+            gradient_accumulation_steps=1,
+            num_train_epochs=num_epochs,
+            learning_rate=self.learning_rate,
+            bf16=True,  # Use bfloat16 instead of fp16 for better stability with quantized models
+            save_strategy="epoch",
+            logging_steps=10,
+            report_to="none",
+            warmup_steps=50,
+            lr_scheduler_type="cosine",
+            max_grad_norm=1.0,
+        )
+
+        trainer = Trainer(
+            model=self.model,
+            args=training_args,
+            train_dataset=tokenized_dataset["train"],
+            data_collator=DataCollatorForLanguageModeling(
+                tokenizer=self.tokenizer,
+                mlm=False
+            )
+        )
+
+        trainer.train()
+        logger.info("Training completed")
+
+    def save_checkpoint(self, task_id: int, dataset_name: str) -> Path:
+        """
+        Save model checkpoint.
+
+        Args:
+            task_id: Task ID number
+            dataset_name: Name of the dataset
+
+        Returns:
+            Path to saved checkpoint
+        """
+        assert self.model is not None, "Model not initialized."
+        assert self.tokenizer is not None, "Tokenizer not initialized."
+
+        checkpoint_path = self.output_dir / f"task_{task_id}_{dataset_name}"
+        logger.info(f"Saving checkpoint to {checkpoint_path}")
+
+        self.model.save_pretrained(str(checkpoint_path))
+        self.tokenizer.save_pretrained(str(checkpoint_path))
+
+        logger.info(f"Checkpoint saved successfully")
+        return checkpoint_path
+
+    def run_continual_learning(
+        self,
+        tasks: List[Task],
+        auto_resume: bool = True,
+        use_quantization: bool = True,
+    ) -> None:
+        """
+        Run continual learning on a sequence of tasks with auto-resume.
+
+        Args:
+            tasks: List of Task objects
+            auto_resume: Whether to automatically resume from last checkpoint
+            use_quantization: Whether to use 4-bit quantization
+        """
+        # Find last checkpoint if auto-resume is enabled
+        start_task_id = 0
+        checkpoint_path = None
+
+        if auto_resume:
+            last_task_id, checkpoint_path = self.find_last_checkpoint(tasks)
+
+            if last_task_id is not None:
+                start_task_id = last_task_id + 1
+                logger.info("=" * 80)
+                logger.info(f"RESUMING FROM CHECKPOINT")
+                logger.info(f"Last completed task: {last_task_id} ({tasks[last_task_id]})")
+                logger.info(f"Resuming from task: {start_task_id}")
+                logger.info("=" * 80)
+
+                if start_task_id >= len(tasks):
+                    logger.info("All tasks already completed!")
+                    return
+            else:
+                logger.info("=" * 80)
+                logger.info("STARTING FRESH (no checkpoints found)")
+                logger.info("=" * 80)
+        else:
+            logger.info("=" * 80)
+            logger.info("STARTING FRESH (auto-resume disabled)")
+            logger.info("=" * 80)
+
+        # Setup model
+        self.setup_model_and_tokenizer(checkpoint_path=checkpoint_path, use_quantization=use_quantization)
+
+        # Train on remaining tasks
+        for task_id in range(start_task_id, len(tasks)):
+            task = tasks[task_id]
+
+            logger.info("=" * 80)
+            logger.info(f"TASK {task_id}/{len(tasks)-1}: {task}")
+            logger.info("=" * 80)
+
+            try:
+                # Prepare dataset
+                tokenized_dataset = self.get_tokenized_dataset(task.dataset_name)
+
+                # Train
+                self.train_model(tokenized_dataset, num_epochs=task.num_epochs)
+
+                # Save checkpoint
+                self.save_checkpoint(task_id, task.dataset_name)
+
+                logger.info(f"✓ Task {task_id} completed successfully")
+
+            except Exception as e:
+                logger.error("=" * 80)
+                logger.error(f"✗ Task {task_id} FAILED with error:")
+                logger.error(f"{type(e).__name__}: {e}")
+                logger.error("=" * 80)
+
+                if task_id > 0:
+                    logger.info(f"Last successful checkpoint: task_{task_id-1}_{tasks[task_id-1].dataset_name}")
+                    logger.info(f"To resume, simply run: python training.py")
+                else:
+                    logger.info("Training failed on first task. No checkpoint available.")
+
+                raise
+
+        logger.info("=" * 80)
+        logger.info("🎉 ALL TASKS COMPLETED SUCCESSFULLY! 🎉")
+        logger.info("=" * 80)
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="LoRA Continual Learning with Auto-Resume",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Auto-resume from last checkpoint (default)
+  python training.py
+
+  # Start fresh, ignoring existing checkpoints
+  python training.py --no-resume
+
+  # Custom configuration
+  python training.py --output-dir ./my-checkpoints --batch-size 16
+        """
+    )
+
+    # Training control
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Start training from scratch, ignoring existing checkpoints"
+    )
+
+    # Paths
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="./lora-continual",
+        help="Directory to save task checkpoints (default: ./lora-continual)"
+    )
+    parser.add_argument(
+        "--training-output-dir",
+        type=str,
+        default="./lora-output",
+        help="Directory for training artifacts (default: ./lora-output)"
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="TRACE-Benchmark/LLM-CL-Benchmark_500",
+        help="Root directory for datasets (default: TRACE-Benchmark/LLM-CL-Benchmark_500)"
+    )
+
+    # Training hyperparameters
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Training batch size (default: 32, increase to 128+ for H200)"
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=5e-5,
+        help="Learning rate (default: 5e-5)"
+    )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=512,
+        help="Maximum sequence length (default: 512)"
+    )
+    parser.add_argument(
+        "--no-quantization",
+        action="store_true",
+        help="Disable 4-bit quantization (recommended for H200 - faster training)"
+    )
+
+    args = parser.parse_args()
+
+    # Define all tasks
+    tasks = [
+        # Task(dataset_name='C-STANCE', num_epochs=5),
+        Task(dataset_name='FOMC', num_epochs=3),
+        # Task(dataset_name='MeetingBank', num_epochs=7),
+        # Task(dataset_name='Py150', num_epochs=5),
+        # Task(dataset_name='ScienceQA', num_epochs=3),
+        # Task(dataset_name='NumGLUE-cm', num_epochs=5),
+        # Task(dataset_name='NumGLUE-ds', num_epochs=5),
+        # Task(dataset_name='20Minuten', num_epochs=7),
+    ]
+
+    logger.info("=" * 80)
+    logger.info("CONTINUAL LEARNING TRAINING")
+    logger.info(f"Total tasks: {len(tasks)}")
+    logger.info(f"Tasks: {[task.dataset_name for task in tasks]}")
+    logger.info(f"Auto-resume: {not args.no_resume}")
+    logger.info(f"Quantization: {'enabled (4-bit)' if not args.no_quantization else 'disabled (full precision)'}")
+    logger.info(f"Batch size: {args.batch_size}")
+    logger.info("=" * 80)
+
+    # Initialize trainer
+    trainer = ContinualLearningTrainer(
+        output_dir=args.output_dir,
+        training_output_dir=args.training_output_dir,
+        data_dir=args.data_dir,
+        max_length=args.max_length,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+    )
+
+    # Run continual learning
+    trainer.run_continual_learning(
+        tasks=tasks,
+        auto_resume=not args.no_resume,
+        use_quantization=not args.no_quantization,
+    )
+
+
+if __name__ == "__main__":
+    main()
