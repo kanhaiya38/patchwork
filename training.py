@@ -11,8 +11,8 @@ Usage:
     # Start fresh (ignore existing checkpoints)
     python training.py --no-resume
 
-    # Custom configuration
-    python training.py --output-dir ./my-checkpoints --batch-size 16
+    # Custom output directory
+    python training.py --output-base-dir ./my-experiment --batch-size 16
 """
 
 import argparse
@@ -20,7 +20,7 @@ import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import torch
 from datasets import load_dataset
@@ -62,8 +62,7 @@ class ContinualLearningTrainer:
     def __init__(
         self,
         base_model_name: str = "openlm-research/open_llama_3b_v2",
-        output_dir: str = "./lora-continual",
-        training_output_dir: str = "./lora-output",
+        output_base_dir: str = "./experiments",
         data_dir: str = "TRACE-Benchmark/LLM-CL-Benchmark_500",
         max_length: int = 512,
         batch_size: int = 32,
@@ -74,17 +73,22 @@ class ContinualLearningTrainer:
 
         Args:
             base_model_name: HuggingFace model identifier
-            output_dir: Directory to save task checkpoints
-            training_output_dir: Directory for training artifacts
+            output_base_dir: Base directory for all outputs (will create 'continual' and 'checkpoints' subdirs)
             data_dir: Root directory for datasets
             max_length: Maximum sequence length for tokenization
             batch_size: Training batch size
             learning_rate: Learning rate
         """
         self.base_model_name = base_model_name
-        self.output_dir = Path(output_dir)
-        self.training_output_dir = Path(training_output_dir)
+        self.output_base_dir = Path(output_base_dir)
+        self.output_dir = self.output_base_dir / "continual"  # Task checkpoints
+        self.training_output_dir = self.output_base_dir / "checkpoints"  # Training artifacts
         self.data_dir = Path(data_dir)
+
+        # Create cache dir using data_dir name for uniqueness
+        data_dir_name = self.data_dir.name
+        self.cache_dir = Path(".cache") / "tokenized_datasets" / data_dir_name
+
         self.max_length = max_length
         self.batch_size = batch_size
         self.learning_rate = learning_rate
@@ -93,8 +97,10 @@ class ContinualLearningTrainer:
         self.tokenizer: Optional[AutoTokenizer] = None
 
         # Create output directories
+        self.output_base_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.training_output_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def find_last_checkpoint(self, tasks: List[Task]) -> Tuple[Optional[int], Optional[Path]]:
         """
@@ -192,7 +198,8 @@ class ContinualLearningTrainer:
 
     def get_tokenized_dataset(self, dataset_name: str):
         """
-        Load and tokenize dataset (same logic as notebook).
+        Load and tokenize dataset with automatic caching.
+        Cache is stored in .cache/tokenized_datasets/{data_dir_name}/ directory.
 
         Args:
             dataset_name: Name of the dataset subdirectory
@@ -201,6 +208,19 @@ class ContinualLearningTrainer:
             Tokenized dataset ready for training
         """
         assert self.tokenizer is not None, "Tokenizer not initialized. Call setup_model_and_tokenizer first."
+
+        # Check for cached tokenized dataset
+        cache_path = self.cache_dir / f"{dataset_name}_maxlen{self.max_length}"
+
+        if cache_path.exists():
+            logger.info(f"Loading cached tokenized dataset from: {cache_path}")
+            try:
+                from datasets import load_from_disk
+                tokenized_dataset = load_from_disk(str(cache_path))
+                logger.info(f"✓ Cached dataset loaded (skipped formatting & tokenization)")
+                return tokenized_dataset
+            except Exception as e:
+                logger.warning(f"Failed to load cached dataset: {e}. Re-processing...")
 
         logger.info(f"Loading dataset: {dataset_name}")
 
@@ -241,6 +261,10 @@ class ContinualLearningTrainer:
             batched=True,
             remove_columns=["text"]
         )
+
+        # Save to cache for future use
+        logger.info(f"Saving tokenized dataset to cache: {cache_path}")
+        tokenized_dataset.save_to_disk(str(cache_path))
 
         logger.info(f"Dataset {dataset_name} prepared successfully")
         return tokenized_dataset
@@ -405,8 +429,11 @@ Examples:
   # Start fresh, ignoring existing checkpoints
   python training.py --no-resume
 
+  # Custom output directory
+  python training.py --output-base-dir ./my-experiment
+
   # Custom configuration
-  python training.py --output-dir ./my-checkpoints --batch-size 16
+  python training.py --output-base-dir ./my-experiment --batch-size 16
         """
     )
 
@@ -419,16 +446,10 @@ Examples:
 
     # Paths
     parser.add_argument(
-        "--output-dir",
+        "--output-base-dir",
         type=str,
-        default="./lora-continual",
-        help="Directory to save task checkpoints (default: ./lora-continual)"
-    )
-    parser.add_argument(
-        "--training-output-dir",
-        type=str,
-        default="./lora-output",
-        help="Directory for training artifacts (default: ./lora-output)"
+        default="./experiments",
+        help="Base directory for outputs (creates 'continual' and 'checkpoints' subdirs, default: ./experiments)"
     )
     parser.add_argument(
         "--data-dir",
@@ -480,6 +501,9 @@ Examples:
     logger.info("CONTINUAL LEARNING TRAINING")
     logger.info(f"Total tasks: {len(tasks)}")
     logger.info(f"Tasks: {[task.dataset_name for task in tasks]}")
+    logger.info(f"Output directory: {args.output_base_dir}")
+    logger.info(f"  - Task checkpoints: {args.output_base_dir}/continual")
+    logger.info(f"  - Training artifacts: {args.output_base_dir}/checkpoints")
     logger.info(f"Auto-resume: {not args.no_resume}")
     logger.info(f"Quantization: {'enabled (4-bit)' if not args.no_quantization else 'disabled (full precision)'}")
     logger.info(f"Batch size: {args.batch_size}")
@@ -487,8 +511,7 @@ Examples:
 
     # Initialize trainer
     trainer = ContinualLearningTrainer(
-        output_dir=args.output_dir,
-        training_output_dir=args.training_output_dir,
+        output_base_dir=args.output_base_dir,
         data_dir=args.data_dir,
         max_length=args.max_length,
         batch_size=args.batch_size,
