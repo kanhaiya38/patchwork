@@ -37,11 +37,8 @@ from transformers import (
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('training.log')
-    ]
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler("training.log")],
 )
 logger = logging.getLogger(__name__)
 
@@ -49,6 +46,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Task:
     """Represents a training task in the continual learning sequence."""
+
     dataset_name: str
     num_epochs: int
 
@@ -82,7 +80,9 @@ class ContinualLearningTrainer:
         self.base_model_name = base_model_name
         self.output_base_dir = Path(output_base_dir)
         self.output_dir = self.output_base_dir / "continual"  # Task checkpoints
-        self.training_output_dir = self.output_base_dir / "checkpoints"  # Training artifacts
+        self.training_output_dir = (
+            self.output_base_dir / "checkpoints"
+        )  # Training artifacts
         self.data_dir = Path(data_dir)
 
         # Create cache dir using data_dir name for uniqueness
@@ -102,7 +102,9 @@ class ContinualLearningTrainer:
         self.training_output_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def find_last_checkpoint(self, tasks: List[Task]) -> Tuple[Optional[int], Optional[Path]]:
+    def find_last_checkpoint(
+        self, tasks: List[Task]
+    ) -> Tuple[Optional[int], Optional[Path]]:
         """
         Find the last successful checkpoint.
 
@@ -118,7 +120,10 @@ class ContinualLearningTrainer:
             task = tasks[task_id]
             checkpoint_path = self.output_dir / f"task_{task_id}_{task.dataset_name}"
 
-            if checkpoint_path.exists() and (checkpoint_path / "adapter_config.json").exists():
+            if (
+                checkpoint_path.exists()
+                and (checkpoint_path / "adapter_config.json").exists()
+            ):
                 logger.info(f"Found checkpoint: {checkpoint_path}")
                 return task_id, checkpoint_path
 
@@ -126,9 +131,7 @@ class ContinualLearningTrainer:
         return None, None
 
     def setup_model_and_tokenizer(
-        self,
-        checkpoint_path: Optional[Path] = None,
-        use_quantization: bool = True
+        self, checkpoint_path: Optional[Path] = None, use_quantization: bool = True
     ) -> None:
         """
         Load model and tokenizer, optionally from a checkpoint.
@@ -151,10 +154,7 @@ class ContinualLearningTrainer:
 
         # Load tokenizer
         logger.info(f"Loading tokenizer from {self.base_model_name}")
-        tokenizer = AutoTokenizer.from_pretrained(
-            self.base_model_name,
-            use_fast=False
-        )
+        tokenizer = AutoTokenizer.from_pretrained(self.base_model_name, use_fast=False)
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
         self.tokenizer = tokenizer
@@ -164,6 +164,7 @@ class ContinualLearningTrainer:
         base_model = AutoModelForCausalLM.from_pretrained(
             self.base_model_name,
             quantization_config=bnb_config,
+            torch_dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
         )
@@ -179,7 +180,11 @@ class ContinualLearningTrainer:
                 model.enable_input_require_grads()
         else:
             logger.info("Preparing new LoRA model from scratch...")
-            base_model = prepare_model_for_kbit_training(base_model)
+            if use_quantization:
+                base_model = prepare_model_for_kbit_training(base_model)
+            else:
+                # Enable gradient checkpointing for memory efficiency
+                base_model.gradient_checkpointing_enable()
 
             lora_config = LoraConfig(
                 r=8,
@@ -187,7 +192,7 @@ class ContinualLearningTrainer:
                 target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
                 lora_dropout=0.05,
                 bias="none",
-                task_type="CAUSAL_LM"
+                task_type="CAUSAL_LM",
             )
 
             model = get_peft_model(base_model, lora_config)
@@ -207,7 +212,9 @@ class ContinualLearningTrainer:
         Returns:
             Tokenized dataset ready for training
         """
-        assert self.tokenizer is not None, "Tokenizer not initialized. Call setup_model_and_tokenizer first."
+        assert (
+            self.tokenizer is not None
+        ), "Tokenizer not initialized. Call setup_model_and_tokenizer first."
 
         # Check for cached tokenized dataset
         cache_path = self.cache_dir / f"{dataset_name}_maxlen{self.max_length}"
@@ -216,8 +223,11 @@ class ContinualLearningTrainer:
             logger.info(f"Loading cached tokenized dataset from: {cache_path}")
             try:
                 from datasets import load_from_disk
+
                 tokenized_dataset = load_from_disk(str(cache_path))
-                logger.info(f"✓ Cached dataset loaded (skipped formatting & tokenization)")
+                logger.info(
+                    f"✓ Cached dataset loaded (skipped formatting & tokenization)"
+                )
                 return tokenized_dataset
             except Exception as e:
                 logger.warning(f"Failed to load cached dataset: {e}. Re-processing...")
@@ -233,34 +243,44 @@ class ContinualLearningTrainer:
             },
         )
 
+        # Capture eos_token to avoid pickling self
+        eos_token = self.tokenizer.eos_token
+
         def format_instruction(examples):
             texts = [
-                prompt + answer
+                prompt + answer + eos_token
                 for prompt, answer in zip(examples["prompt"], examples["answer"])
             ]
             return {"text": texts}
 
         logger.info(f"Formatting dataset: {dataset_name}")
+        logger.info(f"Dataset splits: {list(dataset.keys())}")
+        logger.info(f"Train size: {len(dataset['train'])}")
         formatted_dataset = dataset.map(
             format_instruction,
             batched=True,
-            remove_columns=["prompt", "answer"]
+            batch_size=100,
+            remove_columns=["prompt", "answer"],
         )
+        logger.info(f"Formatting completed successfully")
+
+        # Capture tokenizer and max_length to avoid pickling self
+        tokenizer = self.tokenizer
+        max_length = self.max_length
 
         def tokenize_function(examples):
-            assert self.tokenizer is not None
-            return self.tokenizer(
-                examples["text"],
-                truncation=True,
-                max_length=self.max_length
+            return tokenizer(
+                examples["text"], truncation=True, max_length=max_length
             )
 
         logger.info(f"Tokenizing dataset: {dataset_name}")
         tokenized_dataset = formatted_dataset.map(
             tokenize_function,
             batched=True,
-            remove_columns=["text"]
+            batch_size=1000,
+            remove_columns=["text"],
         )
+        logger.info(f"Tokenization completed successfully")
 
         # Save to cache for future use
         logger.info(f"Saving tokenized dataset to cache: {cache_path}")
@@ -268,6 +288,52 @@ class ContinualLearningTrainer:
 
         logger.info(f"Dataset {dataset_name} prepared successfully")
         return tokenized_dataset
+
+    def data_collator_with_prompt_masking(self, features):
+        """
+        Custom data collator that masks prompt tokens in labels.
+        Only computes loss on answer tokens (last 2 tokens: answer + EOS).
+
+        For FOMC dataset, answers are single letters (A/B/C) which tokenize to ~1 token,
+        plus EOS token = 2 tokens total to train on.
+        """
+        import torch
+        from transformers.data.data_collator import pad_without_fast_tokenizer_warning
+
+        logger.info(f"[DEBUG] Custom data collator called with {len(features)} examples")
+
+        # Determine max length for padding
+        max_length = max(len(feature["input_ids"]) for feature in features)
+
+        batch = {
+            "input_ids": [],
+            "attention_mask": [],
+            "labels": []
+        }
+
+        for feature in features:
+            input_ids = feature["input_ids"]
+            attention_mask = feature["attention_mask"]
+
+            # Create labels: mask all but last 2 tokens (answer + EOS)
+            # -100 is the ignore index for CrossEntropyLoss
+            labels = [-100] * (len(input_ids) - 2) + input_ids[-2:]
+
+            # Pad sequences
+            padding_length = max_length - len(input_ids)
+            if padding_length > 0:
+                input_ids = input_ids + [self.tokenizer.pad_token_id] * padding_length
+                attention_mask = attention_mask + [0] * padding_length
+                labels = labels + [-100] * padding_length
+
+            batch["input_ids"].append(input_ids)
+            batch["attention_mask"].append(attention_mask)
+            batch["labels"].append(labels)
+
+        # Convert to tensors
+        batch = {k: torch.tensor(v) for k, v in batch.items()}
+
+        return batch
 
     def train_model(self, tokenized_dataset, num_epochs: int) -> None:
         """
@@ -277,8 +343,12 @@ class ContinualLearningTrainer:
             tokenized_dataset: Preprocessed dataset
             num_epochs: Number of training epochs
         """
-        assert self.model is not None, "Model not initialized. Call setup_model_and_tokenizer first."
-        assert self.tokenizer is not None, "Tokenizer not initialized. Call setup_model_and_tokenizer first."
+        assert (
+            self.model is not None
+        ), "Model not initialized. Call setup_model_and_tokenizer first."
+        assert (
+            self.tokenizer is not None
+        ), "Tokenizer not initialized. Call setup_model_and_tokenizer first."
 
         logger.info(f"Starting training for {num_epochs} epochs...")
 
@@ -295,16 +365,14 @@ class ContinualLearningTrainer:
             warmup_steps=50,
             lr_scheduler_type="cosine",
             max_grad_norm=1.0,
+            gradient_checkpointing=True,
         )
 
         trainer = Trainer(
             model=self.model,
             args=training_args,
             train_dataset=tokenized_dataset["train"],
-            data_collator=DataCollatorForLanguageModeling(
-                tokenizer=self.tokenizer,
-                mlm=False
-            )
+            data_collator=self.data_collator_with_prompt_masking,
         )
 
         trainer.train()
@@ -358,7 +426,9 @@ class ContinualLearningTrainer:
                 start_task_id = last_task_id + 1
                 logger.info("=" * 80)
                 logger.info(f"RESUMING FROM CHECKPOINT")
-                logger.info(f"Last completed task: {last_task_id} ({tasks[last_task_id]})")
+                logger.info(
+                    f"Last completed task: {last_task_id} ({tasks[last_task_id]})"
+                )
                 logger.info(f"Resuming from task: {start_task_id}")
                 logger.info("=" * 80)
 
@@ -375,7 +445,9 @@ class ContinualLearningTrainer:
             logger.info("=" * 80)
 
         # Setup model
-        self.setup_model_and_tokenizer(checkpoint_path=checkpoint_path, use_quantization=use_quantization)
+        self.setup_model_and_tokenizer(
+            checkpoint_path=checkpoint_path, use_quantization=use_quantization
+        )
 
         # Train on remaining tasks
         for task_id in range(start_task_id, len(tasks)):
@@ -404,10 +476,14 @@ class ContinualLearningTrainer:
                 logger.error("=" * 80)
 
                 if task_id > 0:
-                    logger.info(f"Last successful checkpoint: task_{task_id-1}_{tasks[task_id-1].dataset_name}")
+                    logger.info(
+                        f"Last successful checkpoint: task_{task_id-1}_{tasks[task_id-1].dataset_name}"
+                    )
                     logger.info(f"To resume, simply run: python training.py")
                 else:
-                    logger.info("Training failed on first task. No checkpoint available.")
+                    logger.info(
+                        "Training failed on first task. No checkpoint available."
+                    )
 
                 raise
 
@@ -434,14 +510,14 @@ Examples:
 
   # Custom configuration
   python training.py --output-base-dir ./my-experiment --batch-size 16
-        """
+        """,
     )
 
     # Training control
     parser.add_argument(
         "--no-resume",
         action="store_true",
-        help="Start training from scratch, ignoring existing checkpoints"
+        help="Start training from scratch, ignoring existing checkpoints",
     )
 
     # Paths
@@ -449,13 +525,13 @@ Examples:
         "--output-base-dir",
         type=str,
         default="./experiments",
-        help="Base directory for outputs (creates 'continual' and 'checkpoints' subdirs, default: ./experiments)"
+        help="Base directory for outputs (creates 'continual' and 'checkpoints' subdirs, default: ./experiments)",
     )
     parser.add_argument(
         "--data-dir",
         type=str,
-        default="TRACE-Benchmark/LLM-CL-Benchmark_500",
-        help="Root directory for datasets (default: TRACE-Benchmark/LLM-CL-Benchmark_500)"
+        default="TRACE-Benchmark/LLM-CL-Benchmark_5000",
+        help="Root directory for datasets (default: TRACE-Benchmark/LLM-CL-Benchmark_500)",
     )
 
     # Training hyperparameters
@@ -463,24 +539,24 @@ Examples:
         "--batch-size",
         type=int,
         default=32,
-        help="Training batch size (default: 32, increase to 128+ for H200)"
+        help="Training batch size (default: 32, increase to 128+ for H200)",
     )
     parser.add_argument(
         "--learning-rate",
         type=float,
         default=5e-5,
-        help="Learning rate (default: 5e-5)"
+        help="Learning rate (default: 5e-5)",
     )
     parser.add_argument(
         "--max-length",
         type=int,
         default=512,
-        help="Maximum sequence length (default: 512)"
+        help="Maximum sequence length (default: 512)",
     )
     parser.add_argument(
         "--no-quantization",
         action="store_true",
-        help="Disable 4-bit quantization (recommended for H200 - faster training)"
+        help="Disable 4-bit quantization (recommended for H200 - faster training)",
     )
 
     args = parser.parse_args()
@@ -488,7 +564,7 @@ Examples:
     # Define all tasks
     tasks = [
         # Task(dataset_name='C-STANCE', num_epochs=5),
-        Task(dataset_name='FOMC', num_epochs=3),
+        Task(dataset_name="FOMC", num_epochs=3),
         # Task(dataset_name='MeetingBank', num_epochs=7),
         # Task(dataset_name='Py150', num_epochs=5),
         # Task(dataset_name='ScienceQA', num_epochs=3),
@@ -505,7 +581,9 @@ Examples:
     logger.info(f"  - Task checkpoints: {args.output_base_dir}/continual")
     logger.info(f"  - Training artifacts: {args.output_base_dir}/checkpoints")
     logger.info(f"Auto-resume: {not args.no_resume}")
-    logger.info(f"Quantization: {'enabled (4-bit)' if not args.no_quantization else 'disabled (full precision)'}")
+    logger.info(
+        f"Quantization: {'enabled (4-bit)' if not args.no_quantization else 'disabled (full precision)'}"
+    )
     logger.info(f"Batch size: {args.batch_size}")
     logger.info("=" * 80)
 
