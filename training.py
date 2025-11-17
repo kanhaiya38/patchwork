@@ -189,7 +189,15 @@ class ContinualLearningTrainer:
             lora_config = LoraConfig(
                 r=8,
                 lora_alpha=16,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                target_modules=[
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ],
                 lora_dropout=0.05,
                 bias="none",
                 task_type="CAUSAL_LM",
@@ -251,16 +259,18 @@ class ContinualLearningTrainer:
                 prompt + answer + eos_token
                 for prompt, answer in zip(examples["prompt"], examples["answer"])
             ]
-            return {"text": texts}
+            # Keep 'answer' field for dynamic masking in collator
+            return {"text": texts, "answer": examples["answer"]}
 
         logger.info(f"Formatting dataset: {dataset_name}")
         logger.info(f"Dataset splits: {list(dataset.keys())}")
         logger.info(f"Train size: {len(dataset['train'])}")
+        BATCH_SIZE = 10000
         formatted_dataset = dataset.map(
             format_instruction,
             batched=True,
-            batch_size=100,
-            remove_columns=["prompt", "answer"],
+            batch_size=BATCH_SIZE,
+            remove_columns=["prompt"],  # Keep 'answer' field
         )
         logger.info(f"Formatting completed successfully")
 
@@ -269,18 +279,34 @@ class ContinualLearningTrainer:
         max_length = self.max_length
 
         def tokenize_function(examples):
-            return tokenizer(
+            # Tokenize the text
+            tokenized = tokenizer(
                 examples["text"], truncation=True, max_length=max_length
             )
+            # Return a plain dict to ensure 'answer' field is preserved
+            # BatchEncoding objects may not preserve custom fields
+            return {
+                "input_ids": tokenized["input_ids"],
+                "attention_mask": tokenized["attention_mask"],
+                "answer": examples["answer"],
+            }
 
         logger.info(f"Tokenizing dataset: {dataset_name}")
         tokenized_dataset = formatted_dataset.map(
             tokenize_function,
             batched=True,
-            batch_size=1000,
-            remove_columns=["text"],
+            batch_size=BATCH_SIZE,
+            remove_columns=["text"],  # Keep 'answer' field for collator
         )
         logger.info(f"Tokenization completed successfully")
+
+        # Debug: Check what columns are in the tokenized dataset
+        logger.info(
+            f"[DEBUG] Tokenized dataset columns: {tokenized_dataset['train'].column_names}"
+        )
+        logger.info(
+            f"[DEBUG] Sample from tokenized dataset: {tokenized_dataset['train'][0].keys()}"
+        )
 
         # Save to cache for future use
         logger.info(f"Saving tokenized dataset to cache: {cache_path}")
@@ -292,32 +318,61 @@ class ContinualLearningTrainer:
     def data_collator_with_prompt_masking(self, features):
         """
         Custom data collator that masks prompt tokens in labels.
-        Only computes loss on answer tokens (last 2 tokens: answer + EOS).
+        Dynamically calculates answer length for each example to work with all TRACE datasets.
 
-        For FOMC dataset, answers are single letters (A/B/C) which tokenize to ~1 token,
-        plus EOS token = 2 tokens total to train on.
+        Works for any answer length:
+        - Short answers (FOMC: "A" = 1 token)
+        - Long answers (MeetingBank: summaries = 200+ tokens)
         """
         import torch
-        from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 
-        logger.info(f"[DEBUG] Custom data collator called with {len(features)} examples")
+        # Debug: Log what keys are actually in the features
+        if len(features) > 0:
+            logger.info(
+                f"[DEBUG] Collator received features with keys: {list(features[0].keys())}"
+            )
 
         # Determine max length for padding
         max_length = max(len(feature["input_ids"]) for feature in features)
 
-        batch = {
-            "input_ids": [],
-            "attention_mask": [],
-            "labels": []
-        }
+        batch = {"input_ids": [], "attention_mask": [], "labels": []}
 
-        for feature in features:
+        for idx, feature in enumerate(features):
             input_ids = feature["input_ids"]
             attention_mask = feature["attention_mask"]
 
-            # Create labels: mask all but last 2 tokens (answer + EOS)
+            # Check if 'answer' key exists
+            if "answer" not in feature:
+                logger.error(
+                    f"[DEBUG] Feature {idx} missing 'answer' key. Available keys: {list(feature.keys())}"
+                )
+                raise KeyError(
+                    "'answer' field is missing from features. Check dataset processing."
+                )
+
+            answer_text = feature["answer"]
+
+            # Dynamically calculate answer length by tokenizing it
+            # This handles any answer length (from 1 token to 500+ tokens)
+            answer_with_eos = answer_text + self.tokenizer.eos_token
+            tokenized_answer = self.tokenizer(
+                answer_with_eos,
+                add_special_tokens=False,  # Don't add BOS, we only want answer + EOS
+                truncation=False,
+            )
+            answer_length = len(tokenized_answer["input_ids"])
+
+            # Create labels: mask prompt tokens, keep answer tokens
             # -100 is the ignore index for CrossEntropyLoss
-            labels = [-100] * (len(input_ids) - 2) + input_ids[-2:]
+            prompt_length = len(input_ids) - answer_length
+            if prompt_length < 0:
+                # Safety check: if answer is longer than full sequence, something is wrong
+                logger.warning(
+                    f"Example {idx}: answer_length ({answer_length}) > total_length ({len(input_ids)})"
+                )
+                prompt_length = 0
+
+            labels = [-100] * prompt_length + input_ids[-answer_length:]
 
             # Pad sequences
             padding_length = max_length - len(input_ids)
@@ -366,6 +421,7 @@ class ContinualLearningTrainer:
             lr_scheduler_type="cosine",
             max_grad_norm=1.0,
             gradient_checkpointing=True,
+            remove_unused_columns=False,  # Keep 'answer' field for data collator
         )
 
         trainer = Trainer(
@@ -563,14 +619,14 @@ Examples:
 
     # Define all tasks
     tasks = [
-        # Task(dataset_name='C-STANCE', num_epochs=5),
+        Task(dataset_name='C-STANCE', num_epochs=5),
         Task(dataset_name="FOMC", num_epochs=3),
-        # Task(dataset_name='MeetingBank', num_epochs=7),
-        # Task(dataset_name='Py150', num_epochs=5),
-        # Task(dataset_name='ScienceQA', num_epochs=3),
-        # Task(dataset_name='NumGLUE-cm', num_epochs=5),
-        # Task(dataset_name='NumGLUE-ds', num_epochs=5),
-        # Task(dataset_name='20Minuten', num_epochs=7),
+        Task(dataset_name='MeetingBank', num_epochs=7),
+        Task(dataset_name='Py150', num_epochs=5),
+        Task(dataset_name='ScienceQA', num_epochs=3),
+        Task(dataset_name='NumGLUE-cm', num_epochs=5),
+        Task(dataset_name='NumGLUE-ds', num_epochs=5),
+        Task(dataset_name='20Minuten', num_epochs=7),
     ]
 
     logger.info("=" * 80)
