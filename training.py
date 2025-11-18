@@ -180,8 +180,12 @@ class ContinualLearningTrainer:
             # Ensure model is in training mode and gradients are enabled
             model.train()
             # Enable gradient checkpointing if using quantization
-            if use_quantization:
-                model.enable_input_require_grads()
+            # Enable gradient checkpointing and input gradients
+            if not use_quantization:
+                # For non-quantized models, explicitly enable gradient checkpointing
+                base_model.gradient_checkpointing_enable()
+            # Always enable input gradients for gradient checkpointing to work
+            model.enable_input_require_grads()
         else:
             logger.info("Preparing new LoRA model from scratch...")
             if use_quantization:
@@ -625,12 +629,12 @@ Examples:
     tasks = [
         Task(dataset_name='C-STANCE', num_epochs=5),
         Task(dataset_name="FOMC", num_epochs=3),
-        Task(dataset_name='MeetingBank', num_epochs=7),
-        Task(dataset_name='Py150', num_epochs=5),
-        Task(dataset_name='ScienceQA', num_epochs=3),
-        Task(dataset_name='NumGLUE-cm', num_epochs=5),
-        Task(dataset_name='NumGLUE-ds', num_epochs=5),
-        Task(dataset_name='20Minuten', num_epochs=7),
+        # Task(dataset_name='MeetingBank', num_epochs=7),
+        # Task(dataset_name='Py150', num_epochs=5),
+        # Task(dataset_name='ScienceQA', num_epochs=3),
+        # Task(dataset_name='NumGLUE-cm', num_epochs=5),
+        # Task(dataset_name='NumGLUE-ds', num_epochs=5),
+        # Task(dataset_name='20Minuten', num_epochs=7),
     ]
 
     logger.info("=" * 80)
