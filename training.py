@@ -496,7 +496,7 @@ class ContinualLearningTrainer:
         # Load from checkpoint or prepare new model
         if checkpoint_path:
             logger.info(f"Loading LoRA checkpoint from {checkpoint_path}")
-            model = PeftModel.from_pretrained(base_model, str(checkpoint_path))
+            model = PeftModel.from_pretrained(base_model, str(checkpoint_path), is_trainable=True)
             # Ensure model is in training mode and gradients are enabled
             model.train()
             # Enable gradient checkpointing if using quantization
@@ -1079,9 +1079,9 @@ Examples:
     # ]
     # H200
     tasks = [
-        Task(dataset_name='C-STANCE', num_epochs=5),
+        # Task(dataset_name='C-STANCE', num_epochs=5),
+        Task(dataset_name='MeetingBank', num_epochs=7, batch_size=64), # 7 epochs
         Task(dataset_name="FOMC", num_epochs=3),
-        Task(dataset_name='MeetingBank', num_epochs=7, batch_size=64),
         Task(dataset_name='Py150', num_epochs=5, batch_size=64),
         Task(dataset_name='ScienceQA', num_epochs=3, batch_size=128),
         Task(dataset_name='NumGLUE-cm', num_epochs=5),
