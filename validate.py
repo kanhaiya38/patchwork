@@ -3,6 +3,12 @@ Standalone Validation Script for Continual Learning
 
 Run validation on trained model checkpoints independently from training.
 
+Results are automatically organized in timestamped folders:
+- validate-all: ./validation-results/all_checkpoints_<timestamp>/
+- checkpoint-dir: ./validation-results/<checkpoint_name>_<timestamp>/
+- eval-all-on-dataset: ./validation-results/<dataset>_<timestamp>/
+- eval-base-model: ./validation-results/base_model_<dataset>_<timestamp>/
+
 Usage:
     # Validate a specific checkpoint
     python validate.py --checkpoint-dir ./lora-continual/task_2_MeetingBank
@@ -21,6 +27,7 @@ import argparse
 import json
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -34,6 +41,18 @@ from transformers import (
 )
 
 from evaluation import run_validation
+
+# Task sequence for continual learning (must match training.py)
+TASK_SEQUENCE = [
+    'C-STANCE',      # task_0
+    'FOMC',          # task_1
+    'MeetingBank',   # task_2
+    'Py150',         # task_3
+    'ScienceQA',     # task_4
+    'NumGLUE-cm',    # task_5
+    'NumGLUE-ds',    # task_6
+    '20Minuten',     # task_7
+]
 
 # Configure logging
 logging.basicConfig(
@@ -78,7 +97,7 @@ class EvalDataCollator:
 
 def load_base_model(
     base_model_name: str = "openlm-research/open_llama_3b_v2",
-    use_quantization: bool = True,
+    use_quantization: bool = False,
     device: str = "cuda"
 ):
     """
@@ -125,7 +144,7 @@ def load_base_model(
 def load_model_from_checkpoint(
     checkpoint_path: str,
     base_model_name: str = "openlm-research/open_llama_3b_v2",
-    use_quantization: bool = True,
+    use_quantization: bool = False,
     device: str = "cuda"
 ):
     """
@@ -183,7 +202,7 @@ def validate_base_model(
     max_ans_len: int = 256,
     temperature: float = 0.1,
     batch_size: int = 4,
-    use_quantization: bool = True,
+    use_quantization: bool = False,
     device: str = "cuda"
 ):
     """
@@ -265,7 +284,7 @@ def validate_checkpoint(
     max_ans_len: int = 256,
     temperature: float = 0.1,
     batch_size: int = 4,
-    use_quantization: bool = True,
+    use_quantization: bool = False,
     device: str = "cuda"
 ):
     """
@@ -351,6 +370,8 @@ def validate_all_checkpoints(
     checkpoint_base_dir: str = "./lora-continual",
     data_dir: str = "TRACE-Benchmark/LLM-CL-Benchmark_500",
     output_dir: str = "./validation-results",
+    continual_learning: bool = True,
+    include_base_model: bool = True,
     **kwargs
 ):
     """
@@ -360,6 +381,9 @@ def validate_all_checkpoints(
         checkpoint_base_dir: Base directory containing checkpoints
         data_dir: Root directory for datasets
         output_dir: Directory to save validation results
+        continual_learning: If True, validate each checkpoint on current + all previous tasks.
+                          If False, validate each checkpoint only on its own training dataset.
+        include_base_model: If True, also evaluate base model on all datasets (only with continual_learning=True)
         **kwargs: Additional arguments passed to validate_checkpoint
     """
     checkpoint_base = Path(checkpoint_base_dir)
@@ -372,33 +396,313 @@ def validate_all_checkpoints(
         return
 
     logger.info(f"Found {len(checkpoints)} checkpoints")
+    logger.info(f"Continual learning mode: {continual_learning}")
+    logger.info(f"Include base model: {include_base_model and continual_learning}")
+
+    all_results = []
+
+    # Evaluate base model on all datasets (if requested and in continual learning mode)
+    if continual_learning and include_base_model:
+        logger.info("\n" + "=" * 80)
+        logger.info("EVALUATING BASE MODEL ON ALL DATASETS")
+        logger.info("=" * 80)
+
+        for dataset_name in TASK_SEQUENCE:
+            try:
+                logger.info(f"\nEvaluating base model on: {dataset_name}")
+                evaluation_result = validate_base_model(
+                    dataset_name=dataset_name,
+                    data_dir=data_dir,
+                    output_dir=output_dir,
+                    **kwargs
+                )
+
+                all_results.append({
+                    'checkpoint': 'base_model',
+                    'task_id': -1,
+                    'dataset': dataset_name,
+                    'metrics': evaluation_result
+                })
+
+            except Exception as e:
+                logger.error(f"Base model validation failed on {dataset_name}: {e}")
+                all_results.append({
+                    'checkpoint': 'base_model',
+                    'task_id': -1,
+                    'dataset': dataset_name,
+                    'metrics': {'error': str(e)}
+                })
+                continue
 
     # Validate each checkpoint
     for checkpoint_path in checkpoints:
-        # Extract dataset name from checkpoint directory name
-        # e.g., task_2_MeetingBank -> MeetingBank
-        parts = checkpoint_path.name.split('_', 2)
+        checkpoint_name = checkpoint_path.name
+
+        # Extract task_id and dataset name from checkpoint directory name
+        # e.g., task_2_MeetingBank -> task_id=2, dataset_name=MeetingBank
+        parts = checkpoint_name.split('_', 2)
         if len(parts) >= 3:
-            dataset_name = parts[2]
+            try:
+                task_id = int(parts[1])
+                dataset_name = parts[2]
+            except ValueError:
+                logger.warning(f"Could not parse checkpoint name {checkpoint_name}, skipping")
+                continue
         else:
-            logger.warning(f"Could not extract dataset name from {checkpoint_path.name}, skipping")
+            logger.warning(f"Could not extract info from {checkpoint_name}, skipping")
             continue
 
-        try:
-            validate_checkpoint(
-                checkpoint_path=str(checkpoint_path),
-                dataset_name=dataset_name,
-                data_dir=data_dir,
-                output_dir=output_dir,
-                **kwargs
-            )
-        except Exception as e:
-            logger.error(f"Validation failed for {checkpoint_path}: {e}")
-            continue
+        if continual_learning:
+            # Validate on current task + all previous tasks
+            datasets_to_validate = TASK_SEQUENCE[:task_id + 1]
 
-    logger.info("=" * 80)
+            logger.info("\n" + "=" * 80)
+            logger.info(f"CHECKPOINT: {checkpoint_name}")
+            logger.info(f"Validating on {len(datasets_to_validate)} datasets: {datasets_to_validate}")
+            logger.info("=" * 80)
+
+            for eval_dataset in datasets_to_validate:
+                try:
+                    logger.info(f"\n  Validating on: {eval_dataset}")
+                    evaluation_result = validate_checkpoint(
+                        checkpoint_path=str(checkpoint_path),
+                        dataset_name=eval_dataset,
+                        data_dir=data_dir,
+                        output_dir=output_dir,
+                        **kwargs
+                    )
+
+                    all_results.append({
+                        'checkpoint': checkpoint_name,
+                        'task_id': task_id,
+                        'dataset': eval_dataset,
+                        'metrics': evaluation_result
+                    })
+
+                except Exception as e:
+                    logger.error(f"Validation failed for {checkpoint_path} on {eval_dataset}: {e}")
+                    all_results.append({
+                        'checkpoint': checkpoint_name,
+                        'task_id': task_id,
+                        'dataset': eval_dataset,
+                        'metrics': {'error': str(e)}
+                    })
+                    continue
+        else:
+            # Original behavior: validate only on own training dataset
+            try:
+                logger.info("\n" + "=" * 80)
+                logger.info(f"CHECKPOINT: {checkpoint_name}")
+                logger.info(f"Validating on: {dataset_name}")
+                logger.info("=" * 80)
+
+                evaluation_result = validate_checkpoint(
+                    checkpoint_path=str(checkpoint_path),
+                    dataset_name=dataset_name,
+                    data_dir=data_dir,
+                    output_dir=output_dir,
+                    **kwargs
+                )
+
+                all_results.append({
+                    'checkpoint': checkpoint_name,
+                    'task_id': task_id,
+                    'dataset': dataset_name,
+                    'metrics': evaluation_result
+                })
+
+            except Exception as e:
+                logger.error(f"Validation failed for {checkpoint_path}: {e}")
+                continue
+
+    logger.info("\n" + "=" * 80)
     logger.info("ALL VALIDATIONS COMPLETE")
     logger.info("=" * 80)
+
+    # Save all results
+    if continual_learning:
+        results_path = Path(output_dir) / "continual_learning_results.json"
+    else:
+        results_path = Path(output_dir) / "validation_results.json"
+
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(results_path, 'w') as f:
+        json.dump(all_results, f, indent=2)
+
+    logger.info(f"Results saved to: {results_path}")
+
+    # Compute and save forgetting metrics if in continual learning mode
+    if continual_learning and all_results:
+        forgetting_metrics = compute_forgetting_metrics(all_results, output_dir)
+        logger.info("\n" + "=" * 80)
+        logger.info("FORGETTING METRICS SUMMARY")
+        logger.info("=" * 80)
+        logger.info(f"Average Forgetting: {forgetting_metrics.get('average_forgetting', 'N/A')}")
+        logger.info(f"Final Average Accuracy: {forgetting_metrics.get('final_average_accuracy', 'N/A')}")
+        logger.info("=" * 80)
+
+    return all_results
+
+
+def compute_forgetting_metrics(results, output_dir):
+    """
+    Compute continual learning metrics from validation results.
+
+    Metrics computed:
+    - Forgetting: Performance degradation on previous tasks
+    - Backward Transfer: How training on new tasks affects old task performance
+    - Forward Transfer: How training on previous tasks helps new task performance
+    - Final Average Accuracy: Average performance on all tasks after training
+
+    Args:
+        results: List of validation results from validate_all_checkpoints
+        output_dir: Directory to save metrics summary
+
+    Returns:
+        Dictionary containing computed metrics
+    """
+    logger.info("\nComputing forgetting metrics...")
+
+    # Organize results by checkpoint and dataset
+    # Structure: {checkpoint_name: {dataset_name: metrics}}
+    results_by_checkpoint = {}
+
+    for result in results:
+        checkpoint = result['checkpoint']
+        dataset = result['dataset']
+        metrics = result['metrics']
+
+        if checkpoint not in results_by_checkpoint:
+            results_by_checkpoint[checkpoint] = {}
+
+        results_by_checkpoint[checkpoint][dataset] = metrics
+
+    # Extract performance metric (assuming 'accuracy' or 'rouge' is available)
+    def get_performance(metrics):
+        """Extract primary performance metric from results."""
+        if 'error' in metrics:
+            return None
+        # Try common metric names
+        for key in ['accuracy', 'rouge', 'rouge_l', 'f1', 'exact_match']:
+            if key in metrics:
+                return metrics[key]
+        # If none found, try to get any numeric value
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)):
+                return value
+        return None
+
+    # Track performance for each dataset across checkpoints
+    # Structure: {dataset_name: {checkpoint_name: performance}}
+    dataset_performance = {}
+
+    for checkpoint, datasets in results_by_checkpoint.items():
+        for dataset, metrics in datasets.items():
+            if dataset not in dataset_performance:
+                dataset_performance[dataset] = {}
+
+            perf = get_performance(metrics)
+            if perf is not None:
+                dataset_performance[dataset][checkpoint] = perf
+
+    # Compute forgetting for each dataset
+    # Forgetting = max performance on dataset - final performance on dataset
+    forgetting_per_dataset = {}
+
+    for dataset_idx, dataset_name in enumerate(TASK_SEQUENCE):
+        if dataset_name not in dataset_performance:
+            continue
+
+        performances = dataset_performance[dataset_name]
+
+        # Find the checkpoint where this task was trained (task_idx)
+        task_checkpoint = f"task_{dataset_idx}_{dataset_name}"
+
+        # Get performance on own checkpoint (if available)
+        own_performance = performances.get(task_checkpoint)
+
+        if own_performance is None:
+            continue
+
+        # Track max performance and final performance
+        max_performance = own_performance
+        final_performance = own_performance
+
+        # Check performance in later checkpoints
+        for task_id in range(dataset_idx + 1, len(TASK_SEQUENCE)):
+            later_checkpoint = f"task_{task_id}_{TASK_SEQUENCE[task_id]}"
+            if later_checkpoint in performances:
+                perf = performances[later_checkpoint]
+                max_performance = max(max_performance, perf)
+                final_performance = perf  # Update to latest
+
+        # Forgetting = max_performance - final_performance
+        forgetting = max_performance - final_performance
+        forgetting_per_dataset[dataset_name] = {
+            'own_performance': own_performance,
+            'max_performance': max_performance,
+            'final_performance': final_performance,
+            'forgetting': forgetting
+        }
+
+    # Compute average forgetting (only for tasks that have later checkpoints)
+    forgetting_values = [f['forgetting'] for f in forgetting_per_dataset.values() if f['forgetting'] >= 0]
+    average_forgetting = sum(forgetting_values) / len(forgetting_values) if forgetting_values else 0
+
+    # Compute final average accuracy (last checkpoint's performance on all seen tasks)
+    final_checkpoint_name = None
+    final_task_id = -1
+
+    for checkpoint in results_by_checkpoint.keys():
+        if checkpoint == 'base_model':
+            continue
+        try:
+            task_id = int(checkpoint.split('_')[1])
+            if task_id > final_task_id:
+                final_task_id = task_id
+                final_checkpoint_name = checkpoint
+        except:
+            continue
+
+    final_average_accuracy = None
+    if final_checkpoint_name:
+        final_performances = []
+        for dataset_name in TASK_SEQUENCE[:final_task_id + 1]:
+            if dataset_name in results_by_checkpoint[final_checkpoint_name]:
+                perf = get_performance(results_by_checkpoint[final_checkpoint_name][dataset_name])
+                if perf is not None:
+                    final_performances.append(perf)
+
+        if final_performances:
+            final_average_accuracy = sum(final_performances) / len(final_performances)
+
+    # Prepare summary
+    metrics_summary = {
+        'average_forgetting': average_forgetting,
+        'final_average_accuracy': final_average_accuracy,
+        'forgetting_per_dataset': forgetting_per_dataset,
+        'dataset_performance_matrix': dataset_performance
+    }
+
+    # Save detailed metrics
+    metrics_path = Path(output_dir) / "continual_learning_metrics.json"
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics_summary, f, indent=2)
+
+    logger.info(f"Forgetting metrics saved to: {metrics_path}")
+
+    # Print per-dataset forgetting
+    logger.info("\nPer-dataset forgetting:")
+    for dataset, metrics in forgetting_per_dataset.items():
+        logger.info(f"  {dataset}:")
+        logger.info(f"    Own performance: {metrics['own_performance']:.4f}")
+        logger.info(f"    Max performance: {metrics['max_performance']:.4f}")
+        logger.info(f"    Final performance: {metrics['final_performance']:.4f}")
+        logger.info(f"    Forgetting: {metrics['forgetting']:.4f}")
+
+    return metrics_summary
 
 
 def validate_all_on_single_dataset(
@@ -531,15 +835,26 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # CONTINUAL LEARNING VALIDATION (RECOMMENDED)
+  # Validate all checkpoints with continual learning evaluation
+  # Each checkpoint is tested on its current task + all previous tasks
+  # Also evaluates base model on all datasets and computes forgetting metrics
+  python validate.py --validate-all
+
+  # Same as above but exclude base model evaluation
+  python validate.py --validate-all --no-base-model
+
+  # Disable continual learning mode (old behavior: each checkpoint on own dataset only)
+  python validate.py --validate-all --no-continual-learning
+
+  # SINGLE CHECKPOINT VALIDATION
   # Validate a specific checkpoint on its training dataset
   python validate.py --checkpoint-dir ./lora-continual/task_2_MeetingBank
 
   # Validate a checkpoint on a different dataset
   python validate.py --checkpoint-dir ./lora-continual/task_2_MeetingBank --dataset ScienceQA
 
-  # Validate all checkpoints on their respective training datasets
-  python validate.py --validate-all
-
+  # SINGLE DATASET EVALUATION
   # Evaluate all checkpoints + base model on a single dataset (measure forgetting)
   python validate.py --eval-all-on-dataset MeetingBank
 
@@ -551,39 +866,41 @@ Examples:
         """
     )
 
-    # Checkpoint selection
-    parser.add_argument(
+    # Checkpoint selection (mutually exclusive)
+    checkpoint_group = parser.add_mutually_exclusive_group(required=True)
+    checkpoint_group.add_argument(
         "--checkpoint-dir",
         type=str,
         help="Path to specific checkpoint directory to validate"
     )
-    parser.add_argument(
+    checkpoint_group.add_argument(
         "--validate-all",
         action="store_true",
-        help="Validate all checkpoints on their respective training datasets"
+        help="Validate all checkpoints (with continual learning mode enabled by default)"
     )
-    parser.add_argument(
+    checkpoint_group.add_argument(
         "--eval-all-on-dataset",
         type=str,
         metavar="DATASET",
         help="Evaluate all checkpoints on a single specified dataset (useful for measuring forgetting)"
     )
-    parser.add_argument(
+    checkpoint_group.add_argument(
         "--eval-base-model",
         type=str,
         metavar="DATASET",
         help="Evaluate only the base model (no LoRA) on a specified dataset"
     )
+
+    # Validation mode options
     parser.add_argument(
-        "--include-base-model",
+        "--no-continual-learning",
         action="store_true",
-        default=True,
-        help="Include base model evaluation when using --eval-all-on-dataset (default: True)"
+        help="Disable continual learning mode: validate each checkpoint only on its own training dataset (default: enabled)"
     )
     parser.add_argument(
         "--no-base-model",
         action="store_true",
-        help="Exclude base model evaluation when using --eval-all-on-dataset"
+        help="Exclude base model evaluation (only applies to --validate-all and --eval-all-on-dataset, default: included)"
     )
     parser.add_argument(
         "--checkpoint-base-dir",
@@ -610,7 +927,7 @@ Examples:
         "--output-dir",
         type=str,
         default="./validation-results",
-        help="Directory to save validation results (default: ./validation-results)"
+        help="Base directory for validation results. Subdirectories with checkpoint name and timestamp will be created automatically (default: ./validation-results)"
     )
 
     # Model settings
@@ -623,13 +940,7 @@ Examples:
     parser.add_argument(
         "--use-quantization",
         action="store_true",
-        default=True,
-        help="Use 4-bit quantization (same as training, default: True)"
-    )
-    parser.add_argument(
-        "--no-quantization",
-        action="store_true",
-        help="Disable 4-bit quantization"
+        help="Enable 4-bit quantization (default: disabled)"
     )
 
     # Generation settings
@@ -666,27 +977,35 @@ Examples:
 
     args = parser.parse_args()
 
-    # Validate arguments
-    exclusive_options = sum([
-        bool(args.validate_all),
-        bool(args.checkpoint_dir),
-        bool(args.eval_all_on_dataset),
-        bool(args.eval_base_model)
-    ])
+    # Determine boolean settings
+    continual_learning = not args.no_continual_learning  # Enabled by default
+    include_base_model = not args.no_base_model          # Enabled by default
+    use_quantization = args.use_quantization             # Disabled by default
 
-    if exclusive_options > 1:
-        parser.error("Can only specify one of: --validate-all, --checkpoint-dir, --eval-all-on-dataset, or --eval-base-model")
+    # Create timestamped output directory based on validation mode
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_output_dir = args.output_dir
 
-    if exclusive_options == 0:
-        parser.error("Must specify one of: --validate-all, --checkpoint-dir, --eval-all-on-dataset, or --eval-base-model")
+    if args.validate_all:
+        # For validate-all mode: ./validation-results/all_checkpoints_TIMESTAMP
+        output_dir = Path(base_output_dir) / f"all_checkpoints_{timestamp}"
+    elif args.eval_all_on_dataset:
+        # For eval-all-on-dataset mode: ./validation-results/DATASET_TIMESTAMP
+        output_dir = Path(base_output_dir) / f"{args.eval_all_on_dataset}_{timestamp}"
+    elif args.eval_base_model:
+        # For eval-base-model mode: ./validation-results/base_model_DATASET_TIMESTAMP
+        output_dir = Path(base_output_dir) / f"base_model_{args.eval_base_model}_{timestamp}"
+    else:
+        # For single checkpoint mode: ./validation-results/CHECKPOINT_NAME_TIMESTAMP
+        checkpoint_name = Path(args.checkpoint_dir).name
+        output_dir = Path(base_output_dir) / f"{checkpoint_name}_{timestamp}"
 
-    # Determine quantization setting
-    use_quantization = args.use_quantization and not args.no_quantization
+    logger.info(f"Output directory: {output_dir}")
 
     # Common kwargs
     common_kwargs = {
         "data_dir": args.data_dir,
-        "output_dir": args.output_dir,
+        "output_dir": str(output_dir),
         "base_model_name": args.base_model,
         "max_prompt_len": args.max_prompt_len,
         "max_ans_len": args.max_ans_len,
@@ -700,16 +1019,15 @@ Examples:
     if args.validate_all:
         validate_all_checkpoints(
             checkpoint_base_dir=args.checkpoint_base_dir,
+            continual_learning=continual_learning,
+            include_base_model=include_base_model,
             **common_kwargs
         )
     elif args.eval_all_on_dataset:
-        # Determine if base model should be included
-        include_base = args.include_base_model and not args.no_base_model
-
         validate_all_on_single_dataset(
             dataset_name=args.eval_all_on_dataset,
             checkpoint_base_dir=args.checkpoint_base_dir,
-            include_base_model=include_base,
+            include_base_model=include_base_model,
             **common_kwargs
         )
     elif args.eval_base_model:
