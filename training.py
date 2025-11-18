@@ -157,11 +157,19 @@ class ExperienceReplayBuffer:
         Args:
             path: Directory path to save the buffer
         """
+        import shutil
+
         path.mkdir(parents=True, exist_ok=True)
 
         # Save buffer datasets
         for task_id, dataset in self.buffer.items():
             dataset_path = path / f"task_{task_id}_replay"
+
+            # Remove existing directory if it exists to avoid "can't overwrite itself" error
+            # This happens when resuming training and the dataset was loaded from this location
+            if dataset_path.exists():
+                shutil.rmtree(dataset_path)
+
             dataset.save_to_disk(str(dataset_path))
 
         # Save metadata
