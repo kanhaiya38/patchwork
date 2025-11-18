@@ -3,8 +3,12 @@ LoRA Continual Learning Training with Auto-Resume and Experience Replay
 
 This script handles continual learning with:
 - Automatic checkpoint detection and resume
-- Experience replay to reduce catastrophic forgetting
-- Configurable replay buffer size and mixing ratio
+- Experience replay to reduce catastrophic forgetting (additive mode)
+- Configurable replay buffer size
+
+Replay Strategy:
+    Additive approach - All current task samples + replay samples from previous tasks
+    Example: 5000 (current) + 500 (replay) = 5500 total samples per task
 
 Usage:
     # Auto-resume from last checkpoint with experience replay (default)
@@ -13,8 +17,8 @@ Usage:
     # Start fresh (ignore existing checkpoints)
     python training.py --no-resume
 
-    # Custom replay configuration
-    python training.py --replay-samples-per-task 1000 --replay-mix-ratio 0.4
+    # Custom replay configuration (store more samples per task)
+    python training.py --replay-samples-per-task 1000
 
     # Custom output directory
     python training.py --output-base-dir ./my-experiment --batch-size 16
@@ -264,7 +268,7 @@ class ContinualLearningTrainer:
             learning_rate: Learning rate
             use_experience_replay: Enable experience replay for reducing forgetting
             replay_samples_per_task: Number of samples to store per task in replay buffer
-            replay_mix_ratio: Ratio of replay samples in mixed dataset (0.0-1.0)
+            replay_mix_ratio: (Deprecated - kept for compatibility) All replay samples are now added on top
         """
         self.base_model_name = base_model_name
         self.output_base_dir = Path(output_base_dir)
@@ -606,7 +610,10 @@ class ContinualLearningTrainer:
         replay_dataset: Optional[Dataset] = None
     ) -> None:
         """
-        Train the model on a dataset, optionally mixing with replay samples.
+        Train the model on a dataset, optionally adding replay samples.
+
+        Uses additive replay: Keeps ALL current task samples and adds replay samples on top.
+        Example: 5000 current + 500 replay = 5500 total samples
 
         Args:
             tokenized_dataset: Preprocessed dataset for current task
@@ -624,40 +631,29 @@ class ContinualLearningTrainer:
         # Use task-specific batch size if provided, otherwise use default
         effective_batch_size = batch_size if batch_size is not None else self.batch_size
 
-        # Prepare training dataset with optional replay mixing
+        # Prepare training dataset with optional replay addition
         train_dataset = tokenized_dataset["train"]
 
         if replay_dataset is not None and len(replay_dataset) > 0:
             logger.info("=" * 60)
-            logger.info("EXPERIENCE REPLAY ENABLED")
+            logger.info("EXPERIENCE REPLAY ENABLED (Additive Mode)")
             logger.info(f"Current task samples: {len(train_dataset)}")
             logger.info(f"Replay buffer samples: {len(replay_dataset)}")
 
-            # Calculate how many samples to take from each
-            total_size = len(train_dataset)
-            replay_size = int(total_size * self.replay_mix_ratio)
-            current_size = total_size - replay_size
-
-            # Ensure we have enough samples
-            replay_size = min(replay_size, len(replay_dataset))
-            current_size = total_size - replay_size
+            # Additive approach: Keep ALL current task samples + add replay samples
+            # This ensures full learning on new task while preventing forgetting
+            current_task_size = len(train_dataset)
+            replay_size = len(replay_dataset)
 
             logger.info(f"Mixed dataset composition:")
-            logger.info(f"  - Current task: {current_size} samples ({(1-self.replay_mix_ratio)*100:.1f}%)")
-            logger.info(f"  - Replay buffer: {replay_size} samples ({self.replay_mix_ratio*100:.1f}%)")
+            logger.info(f"  - Current task: {current_task_size} samples (100% of task data)")
+            logger.info(f"  - Replay buffer: {replay_size} samples (added on top)")
 
-            # Create mixed dataset
-            # Shuffle both datasets before selection for better mixing
-            current_shuffled = train_dataset.shuffle(seed=42)
-            replay_shuffled = replay_dataset.shuffle(seed=42)
+            # Concatenate full datasets and shuffle for better mixing
+            train_dataset = concatenate_datasets([train_dataset, replay_dataset]).shuffle(seed=42)
 
-            current_subset = current_shuffled.select(range(min(current_size, len(current_shuffled))))
-            replay_subset = replay_shuffled.select(range(min(replay_size, len(replay_shuffled))))
-
-            # Concatenate and shuffle the mixed dataset
-            train_dataset = concatenate_datasets([current_subset, replay_subset]).shuffle(seed=42)
-
-            logger.info(f"Final mixed dataset size: {len(train_dataset)}")
+            logger.info(f"Total training dataset size: {len(train_dataset)} samples")
+            logger.info(f"  ({current_task_size} new + {replay_size} replay)")
             logger.info("=" * 60)
         else:
             logger.info(f"Training on current task only ({len(train_dataset)} samples)")
@@ -855,8 +851,8 @@ Examples:
   # Disable experience replay (not recommended)
   python training.py --no-replay
 
-  # Custom replay configuration (more samples, higher replay ratio)
-  python training.py --replay-samples-per-task 1000 --replay-mix-ratio 0.4
+  # Custom replay configuration (store more samples per task)
+  python training.py --replay-samples-per-task 1000
 
   # Full custom configuration
   python training.py --output-base-dir ./my-experiment --batch-size 16 --learning-rate 3e-5 --replay-samples-per-task 800
@@ -925,7 +921,7 @@ Examples:
         "--replay-mix-ratio",
         type=float,
         default=0.3,
-        help="Ratio of replay samples in training (0.0-1.0, default: 0.3 = 30%% replay)",
+        help="(Deprecated) No longer used. Replay samples are added on top of full task data.",
     )
 
     args = parser.parse_args()
@@ -962,9 +958,10 @@ Examples:
     logger.info(f"Max answer length: {args.max_ans_len}")
     logger.info("--- Experience Replay Configuration ---")
     if not args.no_replay:
-        logger.info(f"Experience Replay: ENABLED")
-        logger.info(f"  - Samples per task: {args.replay_samples_per_task}")
-        logger.info(f"  - Replay mix ratio: {args.replay_mix_ratio:.1%} (replay) / {1-args.replay_mix_ratio:.1%} (current task)")
+        logger.info(f"Experience Replay: ENABLED (Additive Mode)")
+        logger.info(f"  - Samples stored per task: {args.replay_samples_per_task}")
+        logger.info(f"  - Mode: All replay samples added on top of full task data")
+        logger.info(f"  - Growth: Task dataset increases by ~{args.replay_samples_per_task} samples per task")
     else:
         logger.info(f"Experience Replay: DISABLED")
         logger.info(f"  ⚠️  Warning: Catastrophic forgetting will be higher without replay!")
