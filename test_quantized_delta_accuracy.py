@@ -18,7 +18,6 @@ Usage:
 import argparse
 import json
 import logging
-import os
 import sys
 import tempfile
 import time
@@ -26,7 +25,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 
 import torch
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset
 from peft import PeftModel
 from safetensors.torch import load_file, save_file
 from transformers import (
@@ -35,18 +34,8 @@ from transformers import (
     BitsAndBytesConfig,
 )
 
-# Add src to path for evaluation modules
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
-from evaluations import (
-    eval_ScienceQA,
-    eval_MeetingBank,
-    eval_CStance,
-    eval_Py150,
-    eval_FOMC,
-    eval_NumGLUE_cm,
-    eval_NumGLUE_ds,
-    eval_20Minuten
-)
+# Import existing evaluation infrastructure
+from evaluation import ModelValidator, create_dataloader_from_dataset
 
 # Configure logging
 logging.basicConfig(
@@ -137,7 +126,6 @@ class QuantizedDeltaTester:
             if key in self.base_weights:
                 delta[key] = self.target_weights[key] - self.base_weights[key]
             else:
-                # New weights in target
                 delta[key] = self.target_weights[key]
         return delta
 
@@ -237,7 +225,6 @@ class QuantizedDeltaTester:
                 else:
                     reconstructed[key] = dequantized_delta[key]
             else:
-                # Fallback to original if not in delta
                 reconstructed[key] = self.target_weights[key]
 
         return reconstructed
@@ -284,7 +271,7 @@ class QuantizedDeltaTester:
         batch_size: int = 4,
     ) -> Dict[str, Any]:
         """
-        Evaluate model on a dataset.
+        Evaluate model on a dataset using existing validation infrastructure.
 
         Args:
             model: Model to evaluate
@@ -317,81 +304,36 @@ class QuantizedDeltaTester:
 
         logger.info(f"Evaluating on {len(test_data)} samples")
 
+        # Create DataLoader using helper function from evaluation.py
+        eval_dataloader = create_dataloader_from_dataset(
+            test_data,
+            self.tokenizer,
+            batch_size=batch_size,
+            max_length=1024,
+        )
+
+        # Use ModelValidator from evaluation.py
+        validator = ModelValidator(
+            model=model,
+            tokenizer=self.tokenizer,
+            max_ans_len=max_ans_len,
+            temperature=temperature,
+            inference_batch_size=batch_size,
+            device=self.device,
+        )
+
         # Generate predictions
-        predictions = []
-        ground_truths = []
-        sources = []
-
-        model.eval()
-
-        from tqdm import tqdm
-        for i in tqdm(range(0, len(test_data), batch_size), desc="Generating"):
-            batch = test_data[i : i + batch_size]
-
-            # Prepare inputs
-            prompts = batch["prompt"]
-            answers = batch["answer"]
-
-            sources.extend(prompts)
-            ground_truths.extend(answers)
-
-            # Tokenize
-            inputs = self.tokenizer(
-                prompts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=1024,
-            ).to(self.device)
-
-            prompt_len = inputs.input_ids.shape[1]
-
-            # Generate
-            with torch.no_grad():
-                generate_ids = model.generate(
-                    input_ids=inputs.input_ids,
-                    attention_mask=inputs.attention_mask,
-                    max_new_tokens=max_ans_len,
-                    bos_token_id=self.tokenizer.bos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    pad_token_id=self.tokenizer.unk_token_id,
-                    temperature=temperature,
-                    do_sample=True,
-                    num_return_sequences=1,
-                    use_cache=True,
-                )
-
-            # Decode
-            sequences = self.tokenizer.batch_decode(
-                generate_ids[:, prompt_len:],
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )
-            predictions.extend(sequences)
+        sources, predictions, ground_truths = validator.predict(eval_dataloader)
 
         # Evaluate predictions
-        logger.info("Computing metrics...")
-        if dataset_name == "ScienceQA":
-            evaluation_result = eval_ScienceQA.eval(predictions, ground_truths)
-        elif dataset_name == "MeetingBank":
-            evaluation_result = eval_MeetingBank.eval(predictions, ground_truths)
-        elif dataset_name == "C-STANCE":
-            evaluation_result = eval_CStance.eval(predictions, ground_truths)
-        elif dataset_name == "Py150":
-            evaluation_result = eval_Py150.eval(predictions, ground_truths)
-        elif dataset_name == "FOMC":
-            evaluation_result = eval_FOMC.eval(predictions, ground_truths)
-        elif dataset_name == "NumGLUE-cm":
-            evaluation_result = eval_NumGLUE_cm.eval(predictions, ground_truths)
-        elif dataset_name == "NumGLUE-ds":
-            evaluation_result = eval_NumGLUE_ds.eval(predictions, ground_truths)
-        elif dataset_name == "20Minuten":
-            evaluation_result = eval_20Minuten.eval(sources, predictions, ground_truths)
-        else:
-            logger.warning(f"No evaluation function for {dataset_name}")
-            evaluation_result = {}
+        eval_metrics = validator.evaluate_predictions(
+            dataset_name=dataset_name,
+            sources=sources,
+            predictions=predictions,
+            ground_truths=ground_truths,
+        )
 
-        return evaluation_result
+        return eval_metrics
 
     def test_quantization_method(
         self,
@@ -664,7 +606,7 @@ Based on the accuracy evaluation:
 
 4. **Next Steps**:
    - If accuracy loss is acceptable: Deploy quantized delta compression
-   - If accuracy loss is too high: Try hybrid approaches (see suggestions below)
+   - If accuracy loss is too high: Try hybrid approaches (see COMPRESSION_RECOMMENDATIONS.md)
    - Test on more tasks to ensure consistency
     """)
 
