@@ -1,15 +1,20 @@
 """
-LoRA Continual Learning Training with Auto-Resume
+LoRA Continual Learning Training with Auto-Resume and Experience Replay
 
-This script handles continual learning with automatic checkpoint detection and resume.
-It automatically detects the last successful checkpoint and resumes training from there.
+This script handles continual learning with:
+- Automatic checkpoint detection and resume
+- Experience replay to reduce catastrophic forgetting
+- Configurable replay buffer size and mixing ratio
 
 Usage:
-    # Auto-resume from last checkpoint (default)
+    # Auto-resume from last checkpoint with experience replay (default)
     python training.py
 
     # Start fresh (ignore existing checkpoints)
     python training.py --no-resume
+
+    # Custom replay configuration
+    python training.py --replay-samples-per-task 1000 --replay-mix-ratio 0.4
 
     # Custom output directory
     python training.py --output-base-dir ./my-experiment --batch-size 16
@@ -18,12 +23,14 @@ Usage:
 import argparse
 import logging
 import sys
+import random
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
 import torch
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset, load_from_disk, concatenate_datasets, Dataset
 from peft import PeftModel, LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
     AutoModelForCausalLM,
@@ -55,6 +62,179 @@ class Task:
         return f"{self.dataset_name} ({self.num_epochs} epochs{batch_info})"
 
 
+class ExperienceReplayBuffer:
+    """
+    Stores representative samples from previous tasks for experience replay.
+    Reduces catastrophic forgetting by rehearsing old examples during new task training.
+    """
+
+    def __init__(self, max_samples_per_task: int = 500, selection_strategy: str = "random"):
+        """
+        Initialize the experience replay buffer.
+
+        Args:
+            max_samples_per_task: Maximum number of samples to store per task
+            selection_strategy: Strategy for selecting samples ('random', 'diverse', 'balanced')
+        """
+        self.max_samples_per_task = max_samples_per_task
+        self.selection_strategy = selection_strategy
+        self.buffer: Dict[int, Dataset] = {}  # task_id -> Dataset of stored samples
+        self.task_info: Dict[int, Dict] = {}  # task_id -> metadata
+
+    def add_task_samples(self, task_id: int, dataset: Dataset, task_name: str) -> None:
+        """
+        Store representative samples from a completed task.
+
+        Args:
+            task_id: ID of the completed task
+            dataset: Full training dataset from the task
+            task_name: Name of the task for logging
+        """
+        num_samples = min(self.max_samples_per_task, len(dataset))
+
+        logger.info(f"Adding {num_samples} samples from task {task_id} ({task_name}) to replay buffer")
+
+        if self.selection_strategy == "random":
+            # Randomly sample from the dataset
+            indices = random.sample(range(len(dataset)), num_samples)
+            selected_samples = dataset.select(indices)
+        elif self.selection_strategy == "first":
+            # Take first N samples (deterministic, useful for debugging)
+            selected_samples = dataset.select(range(num_samples))
+        else:
+            # Default to random
+            indices = random.sample(range(len(dataset)), num_samples)
+            selected_samples = dataset.select(indices)
+
+        self.buffer[task_id] = selected_samples
+        self.task_info[task_id] = {
+            "task_name": task_name,
+            "num_samples": num_samples,
+            "total_dataset_size": len(dataset),
+        }
+
+        logger.info(f"✓ Replay buffer now contains {len(self.buffer)} tasks, "
+                   f"total samples: {sum(len(ds) for ds in self.buffer.values())}")
+
+    def get_replay_dataset(self, current_task_id: int) -> Optional[Dataset]:
+        """
+        Get combined dataset from all previous tasks for replay.
+
+        Args:
+            current_task_id: ID of the current task being trained
+
+        Returns:
+            Combined dataset from all previous tasks, or None if no previous tasks
+        """
+        if current_task_id == 0 or len(self.buffer) == 0:
+            return None
+
+        # Collect all samples from previous tasks
+        replay_datasets = []
+        for task_id in range(current_task_id):
+            if task_id in self.buffer:
+                replay_datasets.append(self.buffer[task_id])
+
+        if not replay_datasets:
+            return None
+
+        # Concatenate all replay datasets
+        combined_replay = concatenate_datasets(replay_datasets)
+
+        logger.info(f"Replay dataset contains {len(combined_replay)} samples "
+                   f"from {len(replay_datasets)} previous task(s)")
+
+        return combined_replay
+
+    def save(self, path: Path) -> None:
+        """
+        Save the replay buffer to disk for resume functionality.
+
+        Args:
+            path: Directory path to save the buffer
+        """
+        path.mkdir(parents=True, exist_ok=True)
+
+        # Save buffer datasets
+        for task_id, dataset in self.buffer.items():
+            dataset_path = path / f"task_{task_id}_replay"
+            dataset.save_to_disk(str(dataset_path))
+
+        # Save metadata
+        metadata = {
+            "max_samples_per_task": self.max_samples_per_task,
+            "selection_strategy": self.selection_strategy,
+            "task_info": self.task_info,
+        }
+        metadata_path = path / "replay_metadata.pkl"
+        with open(metadata_path, "wb") as f:
+            pickle.dump(metadata, f)
+
+        logger.info(f"✓ Replay buffer saved to {path}")
+
+    @classmethod
+    def load(cls, path: Path) -> Optional["ExperienceReplayBuffer"]:
+        """
+        Load the replay buffer from disk.
+
+        Args:
+            path: Directory path containing the saved buffer
+
+        Returns:
+            Loaded ExperienceReplayBuffer or None if path doesn't exist
+        """
+        if not path.exists():
+            return None
+
+        metadata_path = path / "replay_metadata.pkl"
+        if not metadata_path.exists():
+            logger.warning(f"No replay metadata found at {path}")
+            return None
+
+        try:
+            # Load metadata
+            with open(metadata_path, "rb") as f:
+                metadata = pickle.load(f)
+
+            # Create buffer instance
+            buffer = cls(
+                max_samples_per_task=metadata["max_samples_per_task"],
+                selection_strategy=metadata["selection_strategy"],
+            )
+            buffer.task_info = metadata["task_info"]
+
+            # Load datasets
+            for task_id in buffer.task_info.keys():
+                dataset_path = path / f"task_{task_id}_replay"
+                if dataset_path.exists():
+                    buffer.buffer[task_id] = load_from_disk(str(dataset_path))
+                else:
+                    logger.warning(f"Missing replay dataset for task {task_id}")
+
+            total_samples = sum(len(ds) for ds in buffer.buffer.values())
+            logger.info(f"✓ Replay buffer loaded from {path} "
+                       f"({len(buffer.buffer)} tasks, {total_samples} samples)")
+
+            return buffer
+
+        except Exception as e:
+            logger.error(f"Failed to load replay buffer: {e}")
+            return None
+
+    def get_stats(self) -> Dict:
+        """Get statistics about the replay buffer."""
+        return {
+            "num_tasks": len(self.buffer),
+            "total_samples": sum(len(ds) for ds in self.buffer.values()),
+            "samples_per_task": {
+                task_id: len(ds) for task_id, ds in self.buffer.items()
+            },
+            "task_names": {
+                task_id: info["task_name"] for task_id, info in self.task_info.items()
+            },
+        }
+
+
 class ContinualLearningTrainer:
     """Handles continual learning with automatic checkpoint detection and resume."""
 
@@ -67,6 +247,9 @@ class ContinualLearningTrainer:
         max_ans_len: int = 512,
         batch_size: int = 32,
         learning_rate: float = 5e-5,
+        use_experience_replay: bool = True,
+        replay_samples_per_task: int = 500,
+        replay_mix_ratio: float = 0.3,
     ):
         """
         Initialize the continual learning trainer.
@@ -79,6 +262,9 @@ class ContinualLearningTrainer:
             max_ans_len: Maximum answer length in tokens
             batch_size: Training batch size
             learning_rate: Learning rate
+            use_experience_replay: Enable experience replay for reducing forgetting
+            replay_samples_per_task: Number of samples to store per task in replay buffer
+            replay_mix_ratio: Ratio of replay samples in mixed dataset (0.0-1.0)
         """
         self.base_model_name = base_model_name
         self.output_base_dir = Path(output_base_dir)
@@ -86,6 +272,7 @@ class ContinualLearningTrainer:
         self.training_output_dir = (
             self.output_base_dir / "checkpoints"
         )  # Training artifacts
+        self.replay_buffer_dir = self.output_base_dir / "replay_buffer"  # Replay buffer storage
         self.data_dir = Path(data_dir)
 
         # Create cache dir using both prompt and answer lengths for uniqueness
@@ -99,6 +286,16 @@ class ContinualLearningTrainer:
         self.batch_size = batch_size
         self.learning_rate = learning_rate
 
+        # Experience replay configuration
+        self.use_experience_replay = use_experience_replay
+        self.replay_mix_ratio = replay_mix_ratio
+        self.replay_buffer: Optional[ExperienceReplayBuffer] = None
+        if use_experience_replay:
+            self.replay_buffer = ExperienceReplayBuffer(
+                max_samples_per_task=replay_samples_per_task,
+                selection_strategy="random"
+            )
+
         self.model: Optional[PeftModel] = None
         self.tokenizer: Optional[AutoTokenizer] = None
 
@@ -106,6 +303,7 @@ class ContinualLearningTrainer:
         self.output_base_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.training_output_dir.mkdir(parents=True, exist_ok=True)
+        self.replay_buffer_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def find_last_checkpoint(
@@ -400,14 +598,21 @@ class ContinualLearningTrainer:
 
         return batch
 
-    def train_model(self, tokenized_dataset, num_epochs: int, batch_size: Optional[int] = None) -> None:
+    def train_model(
+        self,
+        tokenized_dataset,
+        num_epochs: int,
+        batch_size: Optional[int] = None,
+        replay_dataset: Optional[Dataset] = None
+    ) -> None:
         """
-        Train the model on a dataset.
+        Train the model on a dataset, optionally mixing with replay samples.
 
         Args:
-            tokenized_dataset: Preprocessed dataset
+            tokenized_dataset: Preprocessed dataset for current task
             num_epochs: Number of training epochs
             batch_size: Optional task-specific batch size (uses default if not provided)
+            replay_dataset: Optional dataset of replay samples from previous tasks
         """
         assert (
             self.model is not None
@@ -418,6 +623,45 @@ class ContinualLearningTrainer:
 
         # Use task-specific batch size if provided, otherwise use default
         effective_batch_size = batch_size if batch_size is not None else self.batch_size
+
+        # Prepare training dataset with optional replay mixing
+        train_dataset = tokenized_dataset["train"]
+
+        if replay_dataset is not None and len(replay_dataset) > 0:
+            logger.info("=" * 60)
+            logger.info("EXPERIENCE REPLAY ENABLED")
+            logger.info(f"Current task samples: {len(train_dataset)}")
+            logger.info(f"Replay buffer samples: {len(replay_dataset)}")
+
+            # Calculate how many samples to take from each
+            total_size = len(train_dataset)
+            replay_size = int(total_size * self.replay_mix_ratio)
+            current_size = total_size - replay_size
+
+            # Ensure we have enough samples
+            replay_size = min(replay_size, len(replay_dataset))
+            current_size = total_size - replay_size
+
+            logger.info(f"Mixed dataset composition:")
+            logger.info(f"  - Current task: {current_size} samples ({(1-self.replay_mix_ratio)*100:.1f}%)")
+            logger.info(f"  - Replay buffer: {replay_size} samples ({self.replay_mix_ratio*100:.1f}%)")
+
+            # Create mixed dataset
+            # Shuffle both datasets before selection for better mixing
+            current_shuffled = train_dataset.shuffle(seed=42)
+            replay_shuffled = replay_dataset.shuffle(seed=42)
+
+            current_subset = current_shuffled.select(range(min(current_size, len(current_shuffled))))
+            replay_subset = replay_shuffled.select(range(min(replay_size, len(replay_shuffled))))
+
+            # Concatenate and shuffle the mixed dataset
+            train_dataset = concatenate_datasets([current_subset, replay_subset]).shuffle(seed=42)
+
+            logger.info(f"Final mixed dataset size: {len(train_dataset)}")
+            logger.info("=" * 60)
+        else:
+            logger.info(f"Training on current task only ({len(train_dataset)} samples)")
+
         logger.info(f"Starting training for {num_epochs} epochs with batch size {effective_batch_size}...")
 
         training_args = TrainingArguments(
@@ -440,7 +684,7 @@ class ContinualLearningTrainer:
         trainer = Trainer(
             model=self.model,
             args=training_args,
-            train_dataset=tokenized_dataset["train"],
+            train_dataset=train_dataset,
             data_collator=self.data_collator_with_prompt_masking,
         )
 
@@ -501,6 +745,17 @@ class ContinualLearningTrainer:
                 logger.info(f"Resuming from task: {start_task_id}")
                 logger.info("=" * 80)
 
+                # Load replay buffer if resuming and replay is enabled
+                if self.use_experience_replay and self.replay_buffer is not None:
+                    loaded_buffer = ExperienceReplayBuffer.load(self.replay_buffer_dir)
+                    if loaded_buffer is not None:
+                        self.replay_buffer = loaded_buffer
+                        stats = self.replay_buffer.get_stats()
+                        logger.info(f"Replay buffer loaded: {stats['num_tasks']} tasks, "
+                                  f"{stats['total_samples']} samples")
+                    else:
+                        logger.warning("Could not load replay buffer, starting fresh buffer")
+
                 if start_task_id >= len(tasks):
                     logger.info("All tasks already completed!")
                     return
@@ -530,11 +785,31 @@ class ContinualLearningTrainer:
                 # Prepare dataset
                 tokenized_dataset = self.get_tokenized_dataset(task.dataset_name)
 
+                # Get replay dataset from previous tasks if replay is enabled
+                replay_dataset = None
+                if self.use_experience_replay and self.replay_buffer is not None:
+                    replay_dataset = self.replay_buffer.get_replay_dataset(task_id)
+
                 # Train (use task-specific batch size if provided)
-                self.train_model(tokenized_dataset, num_epochs=task.num_epochs, batch_size=task.batch_size)
+                self.train_model(
+                    tokenized_dataset,
+                    num_epochs=task.num_epochs,
+                    batch_size=task.batch_size,
+                    replay_dataset=replay_dataset
+                )
 
                 # Save checkpoint
                 self.save_checkpoint(task_id, task.dataset_name)
+
+                # Add samples from current task to replay buffer for future tasks
+                if self.use_experience_replay and self.replay_buffer is not None:
+                    self.replay_buffer.add_task_samples(
+                        task_id=task_id,
+                        dataset=tokenized_dataset["train"],
+                        task_name=task.dataset_name
+                    )
+                    # Save replay buffer after each task
+                    self.replay_buffer.save(self.replay_buffer_dir)
 
                 logger.info(f"✓ Task {task_id} completed successfully")
 
@@ -564,11 +839,11 @@ class ContinualLearningTrainer:
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="LoRA Continual Learning with Auto-Resume",
+        description="LoRA Continual Learning with Auto-Resume and Experience Replay",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Auto-resume from last checkpoint (default)
+  # Auto-resume from last checkpoint with experience replay (default)
   python training.py
 
   # Start fresh, ignoring existing checkpoints
@@ -577,8 +852,14 @@ Examples:
   # Custom output directory
   python training.py --output-base-dir ./my-experiment
 
-  # Custom configuration
-  python training.py --output-base-dir ./my-experiment --batch-size 16
+  # Disable experience replay (not recommended)
+  python training.py --no-replay
+
+  # Custom replay configuration (more samples, higher replay ratio)
+  python training.py --replay-samples-per-task 1000 --replay-mix-ratio 0.4
+
+  # Full custom configuration
+  python training.py --output-base-dir ./my-experiment --batch-size 16 --learning-rate 3e-5 --replay-samples-per-task 800
         """,
     )
 
@@ -628,6 +909,25 @@ Examples:
         help="Enable 4-bit quantization (useful for smaller GPUs, slower on H200)",
     )
 
+    # Experience replay arguments
+    parser.add_argument(
+        "--no-replay",
+        action="store_true",
+        help="Disable experience replay (not recommended, increases forgetting)",
+    )
+    parser.add_argument(
+        "--replay-samples-per-task",
+        type=int,
+        default=500,
+        help="Number of samples to store per task in replay buffer (default: 500)",
+    )
+    parser.add_argument(
+        "--replay-mix-ratio",
+        type=float,
+        default=0.3,
+        help="Ratio of replay samples in training (0.0-1.0, default: 0.3 = 30%% replay)",
+    )
+
     args = parser.parse_args()
 
     # Define all tasks
@@ -651,13 +951,23 @@ Examples:
     logger.info(f"Output directory: {args.output_base_dir}")
     logger.info(f"  - Task checkpoints: {args.output_base_dir}/continual")
     logger.info(f"  - Training artifacts: {args.output_base_dir}/checkpoints")
+    logger.info(f"  - Replay buffer: {args.output_base_dir}/replay_buffer")
     logger.info(f"Auto-resume: {not args.no_resume}")
     logger.info(
         f"Quantization: {'enabled (4-bit)' if args.quantize else 'disabled (full precision)'}"
     )
     logger.info(f"Batch size: {args.batch_size}")
+    logger.info(f"Learning rate: {args.learning_rate}")
     logger.info(f"Max prompt length: {args.max_prompt_len}")
     logger.info(f"Max answer length: {args.max_ans_len}")
+    logger.info("--- Experience Replay Configuration ---")
+    if not args.no_replay:
+        logger.info(f"Experience Replay: ENABLED")
+        logger.info(f"  - Samples per task: {args.replay_samples_per_task}")
+        logger.info(f"  - Replay mix ratio: {args.replay_mix_ratio:.1%} (replay) / {1-args.replay_mix_ratio:.1%} (current task)")
+    else:
+        logger.info(f"Experience Replay: DISABLED")
+        logger.info(f"  ⚠️  Warning: Catastrophic forgetting will be higher without replay!")
     logger.info("=" * 80)
 
     # Initialize trainer
@@ -668,6 +978,9 @@ Examples:
         max_ans_len=args.max_ans_len,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        use_experience_replay=not args.no_replay,
+        replay_samples_per_task=args.replay_samples_per_task,
+        replay_mix_ratio=args.replay_mix_ratio,
     )
 
     # Run continual learning
