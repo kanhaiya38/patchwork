@@ -932,12 +932,12 @@ Examples:
     tasks = [
         Task(dataset_name='C-STANCE', num_epochs=5),
         Task(dataset_name="FOMC", num_epochs=3),
-        Task(dataset_name='MeetingBank', num_epochs=7, batch_size=64),
-        # Task(dataset_name='Py150', num_epochs=5),
-        # Task(dataset_name='ScienceQA', num_epochs=3),
-        # Task(dataset_name='NumGLUE-cm', num_epochs=5),
-        # Task(dataset_name='NumGLUE-ds', num_epochs=5),
-        # Task(dataset_name='20Minuten', num_epochs=7),
+        Task(dataset_name='MeetingBank', num_epochs=7, batch_size=32),
+        Task(dataset_name='Py150', num_epochs=5, batch_size=32),
+        Task(dataset_name='ScienceQA', num_epochs=3, batch_size=64),
+        Task(dataset_name='NumGLUE-cm', num_epochs=5),
+        Task(dataset_name='NumGLUE-ds', num_epochs=5),
+        Task(dataset_name='20Minuten', num_epochs=7, batch_size=32),
     ]
 
     logger.info("=" * 80)
