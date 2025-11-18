@@ -10,10 +10,10 @@ Results are automatically organized in timestamped folders:
 - eval-base-model: ./validation-results/base_model_<dataset>_<timestamp>/
 
 Usage:
-    # Validate a specific checkpoint
+    # Validate a specific checkpoint (validates on current + all previous tasks by default)
     python validate.py --checkpoint-dir ./lora-continual/task_2_MeetingBank
 
-    # Validate all checkpoints
+    # Validate all checkpoints (validates each on current + all previous tasks)
     python validate.py --validate-all
 
     # Evaluate all checkpoints + base model on a single dataset (measure forgetting)
@@ -848,10 +848,13 @@ Examples:
   python validate.py --validate-all --no-continual-learning
 
   # SINGLE CHECKPOINT VALIDATION
-  # Validate a specific checkpoint on its training dataset
+  # Validate a specific checkpoint on current + all previous tasks (continual learning mode, default)
   python validate.py --checkpoint-dir ./lora-continual/task_2_MeetingBank
 
-  # Validate a checkpoint on a different dataset
+  # Validate a checkpoint only on its training dataset (disable continual learning)
+  python validate.py --checkpoint-dir ./lora-continual/task_2_MeetingBank --no-continual-learning
+
+  # Validate a checkpoint on a specific dataset only
   python validate.py --checkpoint-dir ./lora-continual/task_2_MeetingBank --dataset ScienceQA
 
   # SINGLE DATASET EVALUATION
@@ -1036,22 +1039,79 @@ Examples:
             **common_kwargs
         )
     else:
-        # Extract dataset name from checkpoint if not specified
-        if args.dataset:
-            dataset_name = args.dataset
-        else:
-            checkpoint_name = Path(args.checkpoint_dir).name
-            parts = checkpoint_name.split('_', 2)
-            if len(parts) >= 3:
-                dataset_name = parts[2]
-            else:
-                parser.error(f"Could not extract dataset name from {checkpoint_name}, please specify --dataset")
+        # Single checkpoint validation
+        checkpoint_path = Path(args.checkpoint_dir)
+        checkpoint_name = checkpoint_path.name
 
-        validate_checkpoint(
-            checkpoint_path=args.checkpoint_dir,
-            dataset_name=dataset_name,
-            **common_kwargs
-        )
+        # Extract task_id from checkpoint directory name
+        # e.g., task_2_MeetingBank -> task_id=2, dataset_name=MeetingBank
+        parts = checkpoint_name.split('_', 2)
+        if len(parts) >= 3:
+            try:
+                task_id = int(parts[1])
+                checkpoint_dataset_name = parts[2]
+            except ValueError:
+                parser.error(f"Could not parse checkpoint name {checkpoint_name}")
+        else:
+            parser.error(f"Could not extract info from {checkpoint_name}, expected format: task_N_DatasetName")
+
+        # Determine datasets to validate on
+        if args.dataset:
+            # User specified a single dataset, validate only on that
+            datasets_to_validate = [args.dataset]
+            logger.info(f"Validating on user-specified dataset: {args.dataset}")
+        elif continual_learning:
+            # Continual learning mode: validate on current + all previous tasks
+            datasets_to_validate = TASK_SEQUENCE[:task_id + 1]
+            logger.info(f"Continual learning mode: validating on {len(datasets_to_validate)} datasets: {datasets_to_validate}")
+        else:
+            # Non-continual learning mode: validate only on checkpoint's own dataset
+            datasets_to_validate = [checkpoint_dataset_name]
+            logger.info(f"Validating on checkpoint's training dataset: {checkpoint_dataset_name}")
+
+        logger.info("=" * 80)
+        logger.info(f"CHECKPOINT: {checkpoint_name}")
+        logger.info(f"Datasets to validate: {datasets_to_validate}")
+        logger.info("=" * 80)
+
+        # Validate on each dataset
+        all_results = []
+        for dataset_name in datasets_to_validate:
+            try:
+                logger.info(f"\nValidating on: {dataset_name}")
+                evaluation_result = validate_checkpoint(
+                    checkpoint_path=str(checkpoint_path),
+                    dataset_name=dataset_name,
+                    **common_kwargs
+                )
+
+                all_results.append({
+                    'checkpoint': checkpoint_name,
+                    'task_id': task_id,
+                    'dataset': dataset_name,
+                    'metrics': evaluation_result
+                })
+
+            except Exception as e:
+                logger.error(f"Validation failed on {dataset_name}: {e}")
+                all_results.append({
+                    'checkpoint': checkpoint_name,
+                    'task_id': task_id,
+                    'dataset': dataset_name,
+                    'metrics': {'error': str(e)}
+                })
+                continue
+
+        # Save all results
+        results_path = Path(output_dir) / "validation_results.json"
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(results_path, 'w') as f:
+            json.dump(all_results, f, indent=2)
+
+        logger.info("\n" + "=" * 80)
+        logger.info("VALIDATION COMPLETE")
+        logger.info(f"Results saved to: {results_path}")
+        logger.info("=" * 80)
 
 
 if __name__ == "__main__":
