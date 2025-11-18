@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from peft import PeftModel, LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
     AutoModelForCausalLM,
@@ -31,7 +31,6 @@ from transformers import (
     BitsAndBytesConfig,
     TrainingArguments,
     Trainer,
-    DataCollatorForLanguageModeling,
 )
 
 # Configure logging
@@ -61,8 +60,9 @@ class ContinualLearningTrainer:
         self,
         base_model_name: str = "openlm-research/open_llama_3b_v2",
         output_base_dir: str = "./experiments",
-        data_dir: str = "TRACE-Benchmark/LLM-CL-Benchmark_500",
-        max_length: int = 512,
+        data_dir: str = "TRACE-Benchmark/LLM-CL-Benchmark_5000",
+        max_prompt_len: int = 1024,
+        max_ans_len: int = 512,
         batch_size: int = 32,
         learning_rate: float = 5e-5,
     ):
@@ -73,7 +73,8 @@ class ContinualLearningTrainer:
             base_model_name: HuggingFace model identifier
             output_base_dir: Base directory for all outputs (will create 'continual' and 'checkpoints' subdirs)
             data_dir: Root directory for datasets
-            max_length: Maximum sequence length for tokenization
+            max_prompt_len: Maximum prompt length in tokens
+            max_ans_len: Maximum answer length in tokens
             batch_size: Training batch size
             learning_rate: Learning rate
         """
@@ -85,11 +86,14 @@ class ContinualLearningTrainer:
         )  # Training artifacts
         self.data_dir = Path(data_dir)
 
-        # Create cache dir using data_dir name for uniqueness
+        # Create cache dir using both prompt and answer lengths for uniqueness
         data_dir_name = self.data_dir.name
-        self.cache_dir = Path(".cache") / "tokenized_datasets" / data_dir_name
+        cache_suffix = f"prompt{max_prompt_len}_ans{max_ans_len}"
+        self.cache_dir = Path(".cache") / "tokenized_datasets" / data_dir_name / cache_suffix
 
-        self.max_length = max_length
+        self.max_prompt_len = max_prompt_len
+        self.max_ans_len = max_ans_len
+        self.max_length = max_prompt_len + max_ans_len
         self.batch_size = batch_size
         self.learning_rate = learning_rate
 
@@ -225,13 +229,11 @@ class ContinualLearningTrainer:
         ), "Tokenizer not initialized. Call setup_model_and_tokenizer first."
 
         # Check for cached tokenized dataset
-        cache_path = self.cache_dir / f"{dataset_name}_maxlen{self.max_length}"
+        cache_path = self.cache_dir / dataset_name
 
         if cache_path.exists():
             logger.info(f"Loading cached tokenized dataset from: {cache_path}")
             try:
-                from datasets import load_from_disk
-
                 tokenized_dataset = load_from_disk(str(cache_path))
                 logger.info(
                     f"✓ Cached dataset loaded (skipped formatting & tokenization)"
@@ -251,12 +253,10 @@ class ContinualLearningTrainer:
             },
         )
 
-        # Capture eos_token to avoid pickling self
-        eos_token = self.tokenizer.eos_token
-
         def format_instruction(examples):
+            # Don't add EOS here - will be added explicitly during tokenization
             texts = [
-                prompt + answer + eos_token
+                prompt + answer
                 for prompt, answer in zip(examples["prompt"], examples["answer"])
             ]
             # Keep 'answer' field for dynamic masking in collator
@@ -265,11 +265,11 @@ class ContinualLearningTrainer:
         logger.info(f"Formatting dataset: {dataset_name}")
         logger.info(f"Dataset splits: {list(dataset.keys())}")
         logger.info(f"Train size: {len(dataset['train'])}")
-        BATCH_SIZE = 10000
+        MAP_BATCH_SIZE = 10000  # Batch size for dataset.map() operations
         formatted_dataset = dataset.map(
             format_instruction,
             batched=True,
-            batch_size=BATCH_SIZE,
+            batch_size=MAP_BATCH_SIZE,
             remove_columns=["prompt"],  # Keep 'answer' field
         )
         logger.info(f"Formatting completed successfully")
@@ -277,17 +277,37 @@ class ContinualLearningTrainer:
         # Capture tokenizer and max_length to avoid pickling self
         tokenizer = self.tokenizer
         max_length = self.max_length
+        bos_token_id = tokenizer.bos_token_id
+        eos_token_id = tokenizer.eos_token_id
 
         def tokenize_function(examples):
-            # Tokenize the text
+            # Tokenize without automatic special tokens (TRACE-style)
             tokenized = tokenizer(
-                examples["text"], truncation=True, max_length=max_length
+                examples["text"],
+                truncation=True,
+                max_length=max_length - 2,  # Reserve space for BOS + EOS
+                add_special_tokens=False,   # Explicit control over special tokens
+                padding=False
             )
-            # Return a plain dict to ensure 'answer' field is preserved
-            # BatchEncoding objects may not preserve custom fields
+
+            # Manually add BOS and EOS tokens to each sequence
+            result_ids = []
+            result_mask = []
+            for ids, mask in zip(tokenized["input_ids"], tokenized["attention_mask"]):
+                # Add EOS token if space available
+                if len(ids) < max_length - 1:
+                    ids.append(eos_token_id)
+                    mask.append(1)
+                # Prepend BOS token if space available
+                if len(ids) < max_length:
+                    ids = [bos_token_id] + ids
+                    mask = [1] + mask
+                result_ids.append(ids)
+                result_mask.append(mask)
+
             return {
-                "input_ids": tokenized["input_ids"],
-                "attention_mask": tokenized["attention_mask"],
+                "input_ids": result_ids,
+                "attention_mask": result_mask,
                 "answer": examples["answer"],
             }
 
@@ -295,18 +315,10 @@ class ContinualLearningTrainer:
         tokenized_dataset = formatted_dataset.map(
             tokenize_function,
             batched=True,
-            batch_size=BATCH_SIZE,
+            batch_size=MAP_BATCH_SIZE,
             remove_columns=["text"],  # Keep 'answer' field for collator
         )
         logger.info(f"Tokenization completed successfully")
-
-        # Debug: Check what columns are in the tokenized dataset
-        logger.info(
-            f"[DEBUG] Tokenized dataset columns: {tokenized_dataset['train'].column_names}"
-        )
-        logger.info(
-            f"[DEBUG] Sample from tokenized dataset: {tokenized_dataset['train'][0].keys()}"
-        )
 
         # Save to cache for future use
         logger.info(f"Saving tokenized dataset to cache: {cache_path}")
@@ -324,14 +336,6 @@ class ContinualLearningTrainer:
         - Short answers (FOMC: "A" = 1 token)
         - Long answers (MeetingBank: summaries = 200+ tokens)
         """
-        import torch
-
-        # Debug: Log what keys are actually in the features
-        if len(features) > 0:
-            logger.info(
-                f"[DEBUG] Collator received features with keys: {list(features[0].keys())}"
-            )
-
         # Determine max length for padding
         max_length = max(len(feature["input_ids"]) for feature in features)
 
@@ -344,7 +348,7 @@ class ContinualLearningTrainer:
             # Check if 'answer' key exists
             if "answer" not in feature:
                 logger.error(
-                    f"[DEBUG] Feature {idx} missing 'answer' key. Available keys: {list(feature.keys())}"
+                    f"Feature {idx} missing 'answer' key. Available keys: {list(feature.keys())}"
                 )
                 raise KeyError(
                     "'answer' field is missing from features. Check dataset processing."
@@ -583,12 +587,6 @@ Examples:
         default="./experiments",
         help="Base directory for outputs (creates 'continual' and 'checkpoints' subdirs, default: ./experiments)",
     )
-    parser.add_argument(
-        "--data-dir",
-        type=str,
-        default="TRACE-Benchmark/LLM-CL-Benchmark_5000",
-        help="Root directory for datasets (default: TRACE-Benchmark/LLM-CL-Benchmark_500)",
-    )
 
     # Training hyperparameters
     parser.add_argument(
@@ -604,15 +602,21 @@ Examples:
         help="Learning rate (default: 5e-5)",
     )
     parser.add_argument(
-        "--max-length",
+        "--max-prompt-len",
         type=int,
-        default=512,
-        help="Maximum sequence length (default: 512)",
+        default=1024,
+        help="Maximum prompt length in tokens (default: 1024)",
     )
     parser.add_argument(
-        "--no-quantization",
+        "--max-ans-len",
+        type=int,
+        default=512,
+        help="Maximum answer length in tokens (default: 512)",
+    )
+    parser.add_argument(
+        "--quantize",
         action="store_true",
-        help="Disable 4-bit quantization (recommended for H200 - faster training)",
+        help="Enable 4-bit quantization (useful for smaller GPUs, slower on H200)",
     )
 
     args = parser.parse_args()
@@ -638,16 +642,19 @@ Examples:
     logger.info(f"  - Training artifacts: {args.output_base_dir}/checkpoints")
     logger.info(f"Auto-resume: {not args.no_resume}")
     logger.info(
-        f"Quantization: {'enabled (4-bit)' if not args.no_quantization else 'disabled (full precision)'}"
+        f"Quantization: {'enabled (4-bit)' if args.quantize else 'disabled (full precision)'}"
     )
     logger.info(f"Batch size: {args.batch_size}")
+    logger.info(f"Max prompt length: {args.max_prompt_len}")
+    logger.info(f"Max answer length: {args.max_ans_len}")
     logger.info("=" * 80)
 
     # Initialize trainer
     trainer = ContinualLearningTrainer(
         output_base_dir=args.output_base_dir,
-        data_dir=args.data_dir,
-        max_length=args.max_length,
+        data_dir="TRACE-Benchmark/LLM-CL-Benchmark_5000",
+        max_prompt_len=args.max_prompt_len,
+        max_ans_len=args.max_ans_len,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
     )
@@ -656,7 +663,7 @@ Examples:
     trainer.run_continual_learning(
         tasks=tasks,
         auto_resume=not args.no_resume,
-        use_quantization=not args.no_quantization,
+        use_quantization=args.quantize,
     )
 
 
