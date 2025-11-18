@@ -14,7 +14,7 @@ Usage:
     python validate.py --checkpoint-dir ./lora-continual/task_2_MeetingBank
 
     # Validate all checkpoints (validates each on current + all previous tasks)
-    python validate.py --validate-all
+    python validate.py --validate-all ./lora-continual
 
     # Evaluate all checkpoints + base model on a single dataset (measure forgetting)
     python validate.py --eval-all-on-dataset MeetingBank
@@ -839,13 +839,13 @@ Examples:
   # Validate all checkpoints with continual learning evaluation
   # Each checkpoint is tested on its current task + all previous tasks
   # Also evaluates base model on all datasets and computes forgetting metrics
-  python validate.py --validate-all
+  python validate.py --validate-all ./lora-continual
 
   # Same as above but exclude base model evaluation
-  python validate.py --validate-all --no-base-model
+  python validate.py --validate-all ./lora-continual --no-base-model
 
   # Disable continual learning mode (old behavior: each checkpoint on own dataset only)
-  python validate.py --validate-all --no-continual-learning
+  python validate.py --validate-all ./lora-continual --no-continual-learning
 
   # SINGLE CHECKPOINT VALIDATION
   # Validate a specific checkpoint on current + all previous tasks (continual learning mode, default)
@@ -878,8 +878,9 @@ Examples:
     )
     checkpoint_group.add_argument(
         "--validate-all",
-        action="store_true",
-        help="Validate all checkpoints (with continual learning mode enabled by default)"
+        type=str,
+        metavar="CHECKPOINT_DIR",
+        help="Validate all checkpoints in the specified directory (with continual learning mode enabled by default)"
     )
     checkpoint_group.add_argument(
         "--eval-all-on-dataset",
@@ -909,7 +910,7 @@ Examples:
         "--checkpoint-base-dir",
         type=str,
         default="./lora-continual",
-        help="Base directory containing checkpoints (default: ./lora-continual)"
+        help="Base directory containing checkpoints for --eval-all-on-dataset mode (default: ./lora-continual)"
     )
 
     # Dataset
@@ -1021,7 +1022,7 @@ Examples:
     # Run validation
     if args.validate_all:
         validate_all_checkpoints(
-            checkpoint_base_dir=args.checkpoint_base_dir,
+            checkpoint_base_dir=args.validate_all,
             continual_learning=continual_learning,
             include_base_model=include_base_model,
             **common_kwargs
