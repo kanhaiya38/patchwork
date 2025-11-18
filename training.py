@@ -48,9 +48,11 @@ class Task:
 
     dataset_name: str
     num_epochs: int
+    batch_size: Optional[int] = None  # Optional task-specific batch size
 
     def __str__(self) -> str:
-        return f"{self.dataset_name} ({self.num_epochs} epochs)"
+        batch_info = f", batch_size={self.batch_size}" if self.batch_size else ""
+        return f"{self.dataset_name} ({self.num_epochs} epochs{batch_info})"
 
 
 class ContinualLearningTrainer:
@@ -398,13 +400,14 @@ class ContinualLearningTrainer:
 
         return batch
 
-    def train_model(self, tokenized_dataset, num_epochs: int) -> None:
+    def train_model(self, tokenized_dataset, num_epochs: int, batch_size: Optional[int] = None) -> None:
         """
         Train the model on a dataset.
 
         Args:
             tokenized_dataset: Preprocessed dataset
             num_epochs: Number of training epochs
+            batch_size: Optional task-specific batch size (uses default if not provided)
         """
         assert (
             self.model is not None
@@ -413,11 +416,13 @@ class ContinualLearningTrainer:
             self.tokenizer is not None
         ), "Tokenizer not initialized. Call setup_model_and_tokenizer first."
 
-        logger.info(f"Starting training for {num_epochs} epochs...")
+        # Use task-specific batch size if provided, otherwise use default
+        effective_batch_size = batch_size if batch_size is not None else self.batch_size
+        logger.info(f"Starting training for {num_epochs} epochs with batch size {effective_batch_size}...")
 
         training_args = TrainingArguments(
             output_dir=str(self.training_output_dir),
-            per_device_train_batch_size=self.batch_size,
+            per_device_train_batch_size=effective_batch_size,
             gradient_accumulation_steps=1,
             num_train_epochs=num_epochs,
             learning_rate=self.learning_rate,
@@ -525,8 +530,8 @@ class ContinualLearningTrainer:
                 # Prepare dataset
                 tokenized_dataset = self.get_tokenized_dataset(task.dataset_name)
 
-                # Train
-                self.train_model(tokenized_dataset, num_epochs=task.num_epochs)
+                # Train (use task-specific batch size if provided)
+                self.train_model(tokenized_dataset, num_epochs=task.num_epochs, batch_size=task.batch_size)
 
                 # Save checkpoint
                 self.save_checkpoint(task_id, task.dataset_name)
@@ -626,10 +631,12 @@ Examples:
     args = parser.parse_args()
 
     # Define all tasks
+    # Note: MeetingBank uses batch_size=8 due to long sequences (200+ tokens)
+    # to avoid OOM errors. Other datasets can use the default batch size.
     tasks = [
         Task(dataset_name='C-STANCE', num_epochs=5),
         Task(dataset_name="FOMC", num_epochs=3),
-        # Task(dataset_name='MeetingBank', num_epochs=7),
+        Task(dataset_name='MeetingBank', num_epochs=7, batch_size=8),
         # Task(dataset_name='Py150', num_epochs=5),
         # Task(dataset_name='ScienceQA', num_epochs=3),
         # Task(dataset_name='NumGLUE-cm', num_epochs=5),
