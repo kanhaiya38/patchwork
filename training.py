@@ -2,9 +2,16 @@
 LoRA Continual Learning Training with Auto-Resume and Experience Replay
 
 This script handles continual learning with:
-- Automatic checkpoint detection and resume
+- Automatic checkpoint detection and resume (including intermediate checkpoints)
 - Experience replay to reduce catastrophic forgetting (additive mode)
 - Configurable replay buffer size
+- Recovery from partial task completions
+
+Resume Strategy:
+    1. Checks for completed task checkpoints in continual/ directory
+    2. Checks for intermediate checkpoints in checkpoints/ directory (partial task completions)
+    3. Automatically resumes from the most recent checkpoint (completed or intermediate)
+    4. Tracks training state to detect which task was being trained during interruptions
 
 Replay Strategy:
     Additive approach - All current task samples + replay samples from previous tasks
@@ -29,6 +36,7 @@ import logging
 import sys
 import random
 import pickle
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
@@ -157,11 +165,19 @@ class ExperienceReplayBuffer:
         Args:
             path: Directory path to save the buffer
         """
+        import shutil
+
         path.mkdir(parents=True, exist_ok=True)
 
         # Save buffer datasets
         for task_id, dataset in self.buffer.items():
             dataset_path = path / f"task_{task_id}_replay"
+
+            # Remove existing directory if it exists to avoid "can't overwrite itself" error
+            # This happens when resuming training and the dataset was loaded from this location
+            if dataset_path.exists():
+                shutil.rmtree(dataset_path)
+
             dataset.save_to_disk(str(dataset_path))
 
         # Save metadata
@@ -310,19 +326,95 @@ class ContinualLearningTrainer:
         self.replay_buffer_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
+    def save_training_state(self, task_id: int, task_name: str) -> None:
+        """
+        Save current training state to track partial task completions.
+
+        Args:
+            task_id: Current task ID being trained
+            task_name: Name of the current task
+        """
+        state_path = self.output_base_dir / "training_state.json"
+        state = {
+            "task_id": task_id,
+            "task_name": task_name,
+            "timestamp": str(Path(self.training_output_dir).stat().st_mtime if self.training_output_dir.exists() else 0)
+        }
+        with open(state_path, "w") as f:
+            json.dump(state, f, indent=2)
+        logger.debug(f"Saved training state: task {task_id} ({task_name})")
+
+    def load_training_state(self) -> Optional[Dict]:
+        """
+        Load training state to detect partial task completions.
+
+        Returns:
+            Dict with task_id and task_name, or None if no state file exists
+        """
+        state_path = self.output_base_dir / "training_state.json"
+        if not state_path.exists():
+            return None
+
+        try:
+            with open(state_path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load training state: {e}")
+            return None
+
+    def clear_training_state(self) -> None:
+        """Clear training state file after successful checkpoint save."""
+        state_path = self.output_base_dir / "training_state.json"
+        if state_path.exists():
+            state_path.unlink()
+            logger.debug("Cleared training state")
+
+    def find_intermediate_checkpoint(self) -> Optional[Path]:
+        """
+        Find the latest intermediate checkpoint in the checkpoints directory.
+
+        Returns:
+            Path to the latest checkpoint, or None if no checkpoints found
+        """
+        if not self.training_output_dir.exists():
+            return None
+
+        # Find all checkpoint directories (checkpoint-*, checkpoint-epoch-*)
+        checkpoints = []
+        for item in self.training_output_dir.iterdir():
+            if item.is_dir() and item.name.startswith("checkpoint-"):
+                # Verify it's a valid checkpoint
+                if (item / "adapter_config.json").exists():
+                    checkpoints.append(item)
+
+        if not checkpoints:
+            return None
+
+        # Sort by modification time and return the latest
+        latest = max(checkpoints, key=lambda p: p.stat().st_mtime)
+        logger.info(f"Found intermediate checkpoint: {latest}")
+        return latest
+
     def find_last_checkpoint(
         self, tasks: List[Task]
-    ) -> Tuple[Optional[int], Optional[Path]]:
+    ) -> Tuple[Optional[int], Optional[Path], bool]:
         """
-        Find the last successful checkpoint.
+        Find the last successful checkpoint, including intermediate checkpoints.
 
         Args:
             tasks: List of Task objects
 
         Returns:
-            Tuple of (last_completed_task_id, checkpoint_path) or (None, None) if no checkpoint found
+            Tuple of (task_id, checkpoint_path, is_intermediate):
+            - task_id: ID of the task to resume
+            - checkpoint_path: Path to the checkpoint
+            - is_intermediate: True if resuming from intermediate checkpoint (partial task)
         """
         logger.info("Searching for existing checkpoints...")
+
+        # First, check for completed task checkpoints in continual/
+        last_completed_task_id = None
+        last_completed_checkpoint = None
 
         for task_id in range(len(tasks) - 1, -1, -1):
             task = tasks[task_id]
@@ -332,11 +424,35 @@ class ContinualLearningTrainer:
                 checkpoint_path.exists()
                 and (checkpoint_path / "adapter_config.json").exists()
             ):
-                logger.info(f"Found checkpoint: {checkpoint_path}")
-                return task_id, checkpoint_path
+                logger.info(f"Found completed task checkpoint: {checkpoint_path}")
+                last_completed_task_id = task_id
+                last_completed_checkpoint = checkpoint_path
+                break
+
+        # Check for partial task completion via training state
+        training_state = self.load_training_state()
+
+        if training_state:
+            partial_task_id = training_state.get("task_id")
+            partial_task_name = training_state.get("task_name")
+
+            # Only consider this if it's for a task after the last completed one
+            if (last_completed_task_id is None or partial_task_id > last_completed_task_id):
+                # Check if there are intermediate checkpoints
+                intermediate_checkpoint = self.find_intermediate_checkpoint()
+
+                if intermediate_checkpoint:
+                    logger.info(f"Found partial task completion: task {partial_task_id} ({partial_task_name})")
+                    logger.info(f"Intermediate checkpoint: {intermediate_checkpoint}")
+                    return partial_task_id, intermediate_checkpoint, True
+
+        # Return the last completed task checkpoint
+        if last_completed_task_id is not None:
+            logger.info(f"Will resume from next task after completed task {last_completed_task_id}")
+            return last_completed_task_id, last_completed_checkpoint, False
 
         logger.info("No existing checkpoints found")
-        return None, None
+        return None, None, False
 
     def setup_model_and_tokenizer(
         self, checkpoint_path: Optional[Path] = None, use_quantization: bool = True
@@ -707,6 +823,9 @@ class ContinualLearningTrainer:
         self.model.save_pretrained(str(checkpoint_path))
         self.tokenizer.save_pretrained(str(checkpoint_path))
 
+        # Clear training state after successful checkpoint save
+        self.clear_training_state()
+
         logger.info(f"Checkpoint saved successfully")
         return checkpoint_path
 
@@ -727,19 +846,33 @@ class ContinualLearningTrainer:
         # Find last checkpoint if auto-resume is enabled
         start_task_id = 0
         checkpoint_path = None
+        is_partial_task_resume = False
 
         if auto_resume:
-            last_task_id, checkpoint_path = self.find_last_checkpoint(tasks)
+            last_task_id, checkpoint_path, is_intermediate = self.find_last_checkpoint(tasks)
 
             if last_task_id is not None:
-                start_task_id = last_task_id + 1
-                logger.info("=" * 80)
-                logger.info(f"RESUMING FROM CHECKPOINT")
-                logger.info(
-                    f"Last completed task: {last_task_id} ({tasks[last_task_id]})"
-                )
-                logger.info(f"Resuming from task: {start_task_id}")
-                logger.info("=" * 80)
+                is_partial_task_resume = is_intermediate
+
+                if is_intermediate:
+                    # Resuming from an intermediate checkpoint (partial task)
+                    start_task_id = last_task_id
+                    logger.info("=" * 80)
+                    logger.info(f"RESUMING FROM INTERMEDIATE CHECKPOINT")
+                    logger.info(f"Partial task: {last_task_id} ({tasks[last_task_id]})")
+                    logger.info(f"Will continue training task: {start_task_id}")
+                    logger.info(f"Checkpoint: {checkpoint_path}")
+                    logger.info("=" * 80)
+                else:
+                    # Resuming from a completed task checkpoint
+                    start_task_id = last_task_id + 1
+                    logger.info("=" * 80)
+                    logger.info(f"RESUMING FROM CHECKPOINT")
+                    logger.info(
+                        f"Last completed task: {last_task_id} ({tasks[last_task_id]})"
+                    )
+                    logger.info(f"Resuming from task: {start_task_id}")
+                    logger.info("=" * 80)
 
                 # Load replay buffer if resuming and replay is enabled
                 if self.use_experience_replay and self.replay_buffer is not None:
@@ -778,6 +911,9 @@ class ContinualLearningTrainer:
             logger.info("=" * 80)
 
             try:
+                # Save training state before starting task (for recovery from intermediate checkpoints)
+                self.save_training_state(task_id, task.dataset_name)
+
                 # Prepare dataset
                 tokenized_dataset = self.get_tokenized_dataset(task.dataset_name)
 
@@ -794,10 +930,8 @@ class ContinualLearningTrainer:
                     replay_dataset=replay_dataset
                 )
 
-                # Save checkpoint
-                self.save_checkpoint(task_id, task.dataset_name)
-
-                # Add samples from current task to replay buffer for future tasks
+                # Add samples from current task to replay buffer BEFORE saving checkpoint
+                # This ensures replay buffer is always consistent with completed checkpoints
                 if self.use_experience_replay and self.replay_buffer is not None:
                     self.replay_buffer.add_task_samples(
                         task_id=task_id,
@@ -806,6 +940,9 @@ class ContinualLearningTrainer:
                     )
                     # Save replay buffer after each task
                     self.replay_buffer.save(self.replay_buffer_dir)
+
+                # Save checkpoint (marks task as officially complete)
+                self.save_checkpoint(task_id, task.dataset_name)
 
                 logger.info(f"✓ Task {task_id} completed successfully")
 
