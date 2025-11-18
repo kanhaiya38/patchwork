@@ -10,9 +10,10 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import torch
+from datasets import Dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -215,6 +216,47 @@ class ModelValidator:
 
         logger.info(f"Validation results saved to {output_file}")
         logger.info(f"Metrics: {evaluation_result}")
+
+
+def create_dataloader_from_dataset(
+    dataset: Dataset,
+    tokenizer,
+    batch_size: int = 4,
+    max_length: int = 1024,
+) -> DataLoader:
+    """
+    Create a DataLoader from a HuggingFace Dataset for evaluation.
+
+    Args:
+        dataset: HuggingFace Dataset with 'prompt' and 'answer' fields
+        tokenizer: Tokenizer to use
+        batch_size: Batch size for the DataLoader
+        max_length: Maximum sequence length
+
+    Returns:
+        DataLoader ready for evaluation
+    """
+    def collate_fn(batch):
+        prompts = [item["prompt"] for item in batch]
+        answers = [item["answer"] for item in batch]
+
+        # Tokenize prompts
+        inputs = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+        )
+
+        return {
+            "input_ids": inputs.input_ids,
+            "attention_mask": inputs.attention_mask,
+            "sources": prompts,
+            "gts": answers,
+        }
+
+    return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=False)
 
 
 def run_validation(
