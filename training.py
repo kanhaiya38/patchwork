@@ -34,6 +34,7 @@ Usage:
 import argparse
 import logging
 import sys
+import time
 import random
 import pickle
 import json
@@ -42,6 +43,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
 import torch
+from constants import MAX_PROMPT_LEN, MAX_ANS_LEN
 from datasets import load_dataset, load_from_disk, concatenate_datasets, Dataset
 from peft import PeftModel, LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
@@ -263,8 +265,8 @@ class ContinualLearningTrainer:
         base_model_name: str = "openlm-research/open_llama_3b_v2",
         output_base_dir: str = "./experiments",
         data_dir: str = "TRACE-Benchmark/LLM-CL-Benchmark_5000",
-        max_prompt_len: int = 1024,
-        max_ans_len: int = 512,
+        max_prompt_len: int = MAX_PROMPT_LEN,
+        max_ans_len: int = MAX_ANS_LEN,
         batch_size: int = 32,
         learning_rate: float = 5e-5,
         use_experience_replay: bool = True,
@@ -338,7 +340,7 @@ class ContinualLearningTrainer:
         state = {
             "task_id": task_id,
             "task_name": task_name,
-            "timestamp": str(Path(self.training_output_dir).stat().st_mtime if self.training_output_dir.exists() else 0)
+            "timestamp": str(time.time())
         }
         with open(state_path, "w") as f:
             json.dump(state, f, indent=2)
@@ -368,6 +370,24 @@ class ContinualLearningTrainer:
         if state_path.exists():
             state_path.unlink()
             logger.debug("Cleared training state")
+
+    def cleanup_intermediate_checkpoints(self) -> None:
+        """Remove intermediate checkpoints after task successfully completes."""
+        if not self.training_output_dir.exists():
+            return
+
+        checkpoint_count = 0
+        for item in self.training_output_dir.iterdir():
+            if item.is_dir() and item.name.startswith("checkpoint-"):
+                try:
+                    import shutil
+                    shutil.rmtree(item)
+                    checkpoint_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to remove checkpoint {item}: {e}")
+
+        if checkpoint_count > 0:
+            logger.info(f"Cleaned up {checkpoint_count} intermediate checkpoint(s)")
 
     def find_intermediate_checkpoint(self) -> Optional[Path]:
         """
@@ -442,9 +462,21 @@ class ContinualLearningTrainer:
                 intermediate_checkpoint = self.find_intermediate_checkpoint()
 
                 if intermediate_checkpoint:
-                    logger.info(f"Found partial task completion: task {partial_task_id} ({partial_task_name})")
-                    logger.info(f"Intermediate checkpoint: {intermediate_checkpoint}")
-                    return partial_task_id, intermediate_checkpoint, True
+                    # Validate checkpoint is complete
+                    required_files = ["adapter_config.json", "trainer_state.json", "optimizer.pt"]
+                    is_valid = all((intermediate_checkpoint / f).exists() for f in required_files)
+
+                    if is_valid:
+                        logger.info(f"Found partial task completion: task {partial_task_id} ({partial_task_name})")
+                        logger.info(f"Intermediate checkpoint: {intermediate_checkpoint}")
+                        return partial_task_id, intermediate_checkpoint, True
+                    else:
+                        logger.warning(f"Intermediate checkpoint {intermediate_checkpoint} is incomplete, ignoring")
+                else:
+                    # Stale training_state, no matching checkpoint
+                    logger.warning(f"Training state indicates task {partial_task_id} in progress, "
+                                  f"but no intermediate checkpoint found. Clearing stale state.")
+                    self.clear_training_state()
 
         # Return the last completed task checkpoint
         if last_completed_task_id is not None:
@@ -488,7 +520,7 @@ class ContinualLearningTrainer:
         base_model = AutoModelForCausalLM.from_pretrained(
             self.base_model_name,
             quantization_config=bnb_config,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
         )
@@ -529,6 +561,7 @@ class ContinualLearningTrainer:
                 lora_dropout=0.05,
                 bias="none",
                 task_type="CAUSAL_LM",
+                # use_rslora=True
             )
 
             model = get_peft_model(base_model, lora_config)
@@ -723,7 +756,8 @@ class ContinualLearningTrainer:
         tokenized_dataset,
         num_epochs: int,
         batch_size: Optional[int] = None,
-        replay_dataset: Optional[Dataset] = None
+        replay_dataset: Optional[Dataset] = None,
+        resume_from_checkpoint: Optional[Path] = None
     ) -> None:
         """
         Train the model on a dataset, optionally adding replay samples.
@@ -736,6 +770,7 @@ class ContinualLearningTrainer:
             num_epochs: Number of training epochs
             batch_size: Optional task-specific batch size (uses default if not provided)
             replay_dataset: Optional dataset of replay samples from previous tasks
+            resume_from_checkpoint: Optional path to intermediate checkpoint to resume training from
         """
         assert (
             self.model is not None
@@ -779,7 +814,7 @@ class ContinualLearningTrainer:
         training_args = TrainingArguments(
             output_dir=str(self.training_output_dir),
             per_device_train_batch_size=effective_batch_size,
-            gradient_accumulation_steps=1,
+            gradient_accumulation_steps=4,
             num_train_epochs=num_epochs,
             learning_rate=self.learning_rate,
             bf16=True,  # Use bfloat16 instead of fp16 for better stability with quantized models
@@ -800,7 +835,12 @@ class ContinualLearningTrainer:
             data_collator=self.data_collator_with_prompt_masking,
         )
 
-        trainer.train()
+        # Resume from checkpoint if provided (restores optimizer, scheduler, epoch counter)
+        if resume_from_checkpoint:
+            logger.info(f"Resuming training from checkpoint: {resume_from_checkpoint}")
+            trainer.train(resume_from_checkpoint=str(resume_from_checkpoint))
+        else:
+            trainer.train()
         logger.info("Training completed")
 
     def save_checkpoint(self, task_id: int, dataset_name: str) -> Path:
@@ -922,12 +962,22 @@ class ContinualLearningTrainer:
                 if self.use_experience_replay and self.replay_buffer is not None:
                     replay_dataset = self.replay_buffer.get_replay_dataset(task_id)
 
+                # Determine if we should resume from an intermediate checkpoint
+                # Only resume for the first task if we're continuing a partial task
+                resume_checkpoint = None
+                if task_id == start_task_id and is_partial_task_resume and checkpoint_path:
+                    # Find the latest intermediate checkpoint in checkpoints/ directory
+                    resume_checkpoint = self.find_intermediate_checkpoint()
+                    if resume_checkpoint:
+                        logger.info(f"Will resume training from intermediate checkpoint: {resume_checkpoint}")
+
                 # Train (use task-specific batch size if provided)
                 self.train_model(
                     tokenized_dataset,
                     num_epochs=task.num_epochs,
                     batch_size=task.batch_size,
-                    replay_dataset=replay_dataset
+                    replay_dataset=replay_dataset,
+                    resume_from_checkpoint=resume_checkpoint
                 )
 
                 # Add samples from current task to replay buffer BEFORE saving checkpoint
@@ -943,6 +993,7 @@ class ContinualLearningTrainer:
 
                 # Save checkpoint (marks task as officially complete)
                 self.save_checkpoint(task_id, task.dataset_name)
+                self.cleanup_intermediate_checkpoints()
 
                 logger.info(f"✓ Task {task_id} completed successfully")
 
@@ -1010,6 +1061,12 @@ Examples:
         default="./experiments",
         help="Base directory for outputs (creates 'continual' and 'checkpoints' subdirs, default: ./experiments)",
     )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="TRACE-Benchmark/LLM-CL-Benchmark_5000",
+        help="Dataset directory (default: LLM-CL-Benchmark_5000). Use LLM-CL-Benchmark_500 for quick testing",
+    )
 
     # Training hyperparameters
     parser.add_argument(
@@ -1023,18 +1080,6 @@ Examples:
         type=float,
         default=5e-5,
         help="Learning rate (default: 5e-5)",
-    )
-    parser.add_argument(
-        "--max-prompt-len",
-        type=int,
-        default=1024,
-        help="Maximum prompt length in tokens (default: 1024)",
-    )
-    parser.add_argument(
-        "--max-ans-len",
-        type=int,
-        default=512,
-        help="Maximum answer length in tokens (default: 512)",
     )
     parser.add_argument(
         "--quantize",
@@ -1093,6 +1138,7 @@ Examples:
     logger.info("CONTINUAL LEARNING TRAINING")
     logger.info(f"Total tasks: {len(tasks)}")
     logger.info(f"Tasks: {[task.dataset_name for task in tasks]}")
+    logger.info(f"Dataset directory: {args.data_dir}")
     logger.info(f"Output directory: {args.output_base_dir}")
     logger.info(f"  - Task checkpoints: {args.output_base_dir}/continual")
     logger.info(f"  - Training artifacts: {args.output_base_dir}/checkpoints")
@@ -1103,8 +1149,6 @@ Examples:
     )
     logger.info(f"Batch size: {args.batch_size}")
     logger.info(f"Learning rate: {args.learning_rate}")
-    logger.info(f"Max prompt length: {args.max_prompt_len}")
-    logger.info(f"Max answer length: {args.max_ans_len}")
     logger.info("--- Experience Replay Configuration ---")
     if not args.no_replay:
         logger.info(f"Experience Replay: ENABLED (Additive Mode)")
@@ -1119,9 +1163,7 @@ Examples:
     # Initialize trainer
     trainer = ContinualLearningTrainer(
         output_base_dir=args.output_base_dir,
-        data_dir="TRACE-Benchmark/LLM-CL-Benchmark_5000",
-        max_prompt_len=args.max_prompt_len,
-        max_ans_len=args.max_ans_len,
+        data_dir=args.data_dir,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         use_experience_replay=not args.no_replay,

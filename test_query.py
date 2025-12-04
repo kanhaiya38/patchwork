@@ -22,13 +22,14 @@ import torch
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
+from constants import MAX_PROMPT_LEN, MAX_ANS_LEN
 from model_loader import ModelLoader
 
 
-def generate(model, tokenizer, query, max_tokens=256, temperature=0.1):
+def generate(model, tokenizer, query, max_tokens=MAX_ANS_LEN, temperature=0.1):
     """Generate response for query."""
 
-    inputs = tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    inputs = tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=MAX_PROMPT_LEN)
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
     prompt_len = inputs['input_ids'].shape[1]
 
@@ -95,7 +96,7 @@ def main():
     parser.add_argument("--query", type=str, help="Single query (non-interactive)")
     parser.add_argument("--max-tokens", type=int, default=256, help="Max tokens to generate (default: 256)")
     parser.add_argument("--temperature", type=float, default=0.1, help="Temperature (default: 0.1)")
-    parser.add_argument("--no-quantization", action="store_true", help="Disable quantization")
+    parser.add_argument("--no-quantization", action="store_true", help="Disable quantization", default=True)
 
     args = parser.parse_args()
 

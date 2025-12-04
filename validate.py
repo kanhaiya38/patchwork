@@ -40,6 +40,7 @@ from transformers import (
     BitsAndBytesConfig,
 )
 
+from constants import MAX_PROMPT_LEN, MAX_ANS_LEN
 from evaluation import run_validation
 
 # Task sequence for continual learning (must match training.py)
@@ -198,8 +199,8 @@ def validate_base_model(
     data_dir: str = "TRACE-Benchmark/LLM-CL-Benchmark_500",
     output_dir: str = "./validation-results",
     base_model_name: str = "openlm-research/open_llama_3b_v2",
-    max_prompt_len: int = 512,
-    max_ans_len: int = 256,
+    max_prompt_len: int = MAX_PROMPT_LEN,
+    max_ans_len: int = MAX_ANS_LEN,
     temperature: float = 0.1,
     batch_size: int = 4,
     use_quantization: bool = False,
@@ -280,8 +281,8 @@ def validate_checkpoint(
     data_dir: str = "TRACE-Benchmark/LLM-CL-Benchmark_500",
     output_dir: str = "./validation-results",
     base_model_name: str = "openlm-research/open_llama_3b_v2",
-    max_prompt_len: int = 512,
-    max_ans_len: int = 256,
+    max_prompt_len: int = MAX_PROMPT_LEN,
+    max_ans_len: int = MAX_ANS_LEN,
     temperature: float = 0.1,
     batch_size: int = 4,
     use_quantization: bool = False,
@@ -949,18 +950,6 @@ Examples:
 
     # Generation settings
     parser.add_argument(
-        "--max-prompt-len",
-        type=int,
-        default=512,
-        help="Maximum prompt length (default: 512)"
-    )
-    parser.add_argument(
-        "--max-ans-len",
-        type=int,
-        default=256,
-        help="Maximum answer length (default: 256)"
-    )
-    parser.add_argument(
         "--temperature",
         type=float,
         default=0.1,
@@ -1011,8 +1000,6 @@ Examples:
         "data_dir": args.data_dir,
         "output_dir": str(output_dir),
         "base_model_name": args.base_model,
-        "max_prompt_len": args.max_prompt_len,
-        "max_ans_len": args.max_ans_len,
         "temperature": args.temperature,
         "batch_size": args.batch_size,
         "use_quantization": use_quantization,
