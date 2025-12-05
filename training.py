@@ -43,7 +43,8 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
 import torch
-from constants import MAX_PROMPT_LEN, MAX_ANS_LEN
+from constants import MAX_PROMPT_LEN, MAX_ANS_LEN, DEFAULT_TASK_CONFIGS
+from data_collator import DataCollator
 from datasets import load_dataset, load_from_disk, concatenate_datasets, Dataset
 from peft import PeftModel, LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
@@ -69,10 +70,12 @@ class Task:
 
     dataset_name: str
     num_epochs: int
-    batch_size: Optional[int] = None  # Optional task-specific batch size
+    max_batch_size: Optional[int] = None  # Optional task-specific batch size
 
     def __str__(self) -> str:
-        batch_info = f", batch_size={self.batch_size}" if self.batch_size else ""
+        batch_info = (
+            f", batch_size={self.max_batch_size}" if self.max_batch_size else ""
+        )
         return f"{self.dataset_name} ({self.num_epochs} epochs{batch_info})"
 
 
@@ -82,7 +85,9 @@ class ExperienceReplayBuffer:
     Reduces catastrophic forgetting by rehearsing old examples during new task training.
     """
 
-    def __init__(self, max_samples_per_task: int = 500, selection_strategy: str = "random"):
+    def __init__(
+        self, max_samples_per_task: int = 500, selection_strategy: str = "random"
+    ):
         """
         Initialize the experience replay buffer.
 
@@ -106,7 +111,9 @@ class ExperienceReplayBuffer:
         """
         num_samples = min(self.max_samples_per_task, len(dataset))
 
-        logger.info(f"Adding {num_samples} samples from task {task_id} ({task_name}) to replay buffer")
+        logger.info(
+            f"Adding {num_samples} samples from task {task_id} ({task_name}) to replay buffer"
+        )
 
         if self.selection_strategy == "random":
             # Randomly sample from the dataset
@@ -127,8 +134,10 @@ class ExperienceReplayBuffer:
             "total_dataset_size": len(dataset),
         }
 
-        logger.info(f"✓ Replay buffer now contains {len(self.buffer)} tasks, "
-                   f"total samples: {sum(len(ds) for ds in self.buffer.values())}")
+        logger.info(
+            f"✓ Replay buffer now contains {len(self.buffer)} tasks, "
+            f"total samples: {sum(len(ds) for ds in self.buffer.values())}"
+        )
 
     def get_replay_dataset(self, current_task_id: int) -> Optional[Dataset]:
         """
@@ -155,8 +164,10 @@ class ExperienceReplayBuffer:
         # Concatenate all replay datasets
         combined_replay = concatenate_datasets(replay_datasets)
 
-        logger.info(f"Replay dataset contains {len(combined_replay)} samples "
-                   f"from {len(replay_datasets)} previous task(s)")
+        logger.info(
+            f"Replay dataset contains {len(combined_replay)} samples "
+            f"from {len(replay_datasets)} previous task(s)"
+        )
 
         return combined_replay
 
@@ -180,7 +191,10 @@ class ExperienceReplayBuffer:
             if dataset_path.exists():
                 shutil.rmtree(dataset_path)
 
-            dataset.save_to_disk(str(dataset_path))
+            # Create a fresh copy of the dataset to avoid memory-mapped references
+            # that prevent overwriting the same path
+            dataset_copy = dataset.map(lambda x: x, keep_in_memory=False, load_from_cache_file=False)
+            dataset_copy.save_to_disk(str(dataset_path))
 
         # Save metadata
         metadata = {
@@ -234,8 +248,10 @@ class ExperienceReplayBuffer:
                     logger.warning(f"Missing replay dataset for task {task_id}")
 
             total_samples = sum(len(ds) for ds in buffer.buffer.values())
-            logger.info(f"✓ Replay buffer loaded from {path} "
-                       f"({len(buffer.buffer)} tasks, {total_samples} samples)")
+            logger.info(
+                f"✓ Replay buffer loaded from {path} "
+                f"({len(buffer.buffer)} tasks, {total_samples} samples)"
+            )
 
             return buffer
 
@@ -294,13 +310,17 @@ class ContinualLearningTrainer:
         self.training_output_dir = (
             self.output_base_dir / "checkpoints"
         )  # Training artifacts
-        self.replay_buffer_dir = self.output_base_dir / "replay_buffer"  # Replay buffer storage
+        self.replay_buffer_dir = (
+            self.output_base_dir / "replay_buffer"
+        )  # Replay buffer storage
         self.data_dir = Path(data_dir)
 
         # Create cache dir using both prompt and answer lengths for uniqueness
         data_dir_name = self.data_dir.name
         cache_suffix = f"prompt{max_prompt_len}_ans{max_ans_len}"
-        self.cache_dir = Path(".cache") / "tokenized_datasets" / data_dir_name / cache_suffix
+        self.cache_dir = (
+            Path(".cache") / "tokenized_datasets" / data_dir_name / cache_suffix
+        )
 
         self.max_prompt_len = max_prompt_len
         self.max_ans_len = max_ans_len
@@ -315,7 +335,7 @@ class ContinualLearningTrainer:
         if use_experience_replay:
             self.replay_buffer = ExperienceReplayBuffer(
                 max_samples_per_task=replay_samples_per_task,
-                selection_strategy="random"
+                selection_strategy="random",
             )
 
         self.model: Optional[PeftModel] = None
@@ -340,7 +360,7 @@ class ContinualLearningTrainer:
         state = {
             "task_id": task_id,
             "task_name": task_name,
-            "timestamp": str(time.time())
+            "timestamp": str(time.time()),
         }
         with open(state_path, "w") as f:
             json.dump(state, f, indent=2)
@@ -457,30 +477,56 @@ class ContinualLearningTrainer:
             partial_task_name = training_state.get("task_name")
 
             # Only consider this if it's for a task after the last completed one
-            if (last_completed_task_id is None or partial_task_id > last_completed_task_id):
+            if (
+                last_completed_task_id is None
+                or partial_task_id > last_completed_task_id
+            ):
                 # Check if there are intermediate checkpoints
                 intermediate_checkpoint = self.find_intermediate_checkpoint()
 
                 if intermediate_checkpoint:
                     # Validate checkpoint is complete
-                    required_files = ["adapter_config.json", "trainer_state.json", "optimizer.pt"]
-                    is_valid = all((intermediate_checkpoint / f).exists() for f in required_files)
+                    required_files = [
+                        "adapter_config.json",
+                        "trainer_state.json",
+                        "optimizer.pt",
+                    ]
+                    is_valid = all(
+                        (intermediate_checkpoint / f).exists() for f in required_files
+                    )
 
                     if is_valid:
-                        logger.info(f"Found partial task completion: task {partial_task_id} ({partial_task_name})")
-                        logger.info(f"Intermediate checkpoint: {intermediate_checkpoint}")
+                        logger.info(
+                            f"Found partial task completion: task {partial_task_id} ({partial_task_name})"
+                        )
+                        logger.info(
+                            f"Intermediate checkpoint: {intermediate_checkpoint}"
+                        )
                         return partial_task_id, intermediate_checkpoint, True
                     else:
-                        logger.warning(f"Intermediate checkpoint {intermediate_checkpoint} is incomplete, ignoring")
+                        logger.warning(
+                            f"Intermediate checkpoint {intermediate_checkpoint} is incomplete, ignoring"
+                        )
                 else:
                     # Stale training_state, no matching checkpoint
-                    logger.warning(f"Training state indicates task {partial_task_id} in progress, "
-                                  f"but no intermediate checkpoint found. Clearing stale state.")
+                    logger.warning(
+                        f"Training state indicates task {partial_task_id} in progress, "
+                        f"but no intermediate checkpoint found. Clearing stale state."
+                    )
                     self.clear_training_state()
+            elif partial_task_id == last_completed_task_id:
+                # Task is already completed but training state wasn't cleared (stale state)
+                logger.warning(
+                    f"Training state indicates task {partial_task_id} in progress, "
+                    f"but task checkpoint already exists in continual/. Clearing stale state."
+                )
+                self.clear_training_state()
 
         # Return the last completed task checkpoint
         if last_completed_task_id is not None:
-            logger.info(f"Will resume from next task after completed task {last_completed_task_id}")
+            logger.info(
+                f"Will resume from next task after completed task {last_completed_task_id}"
+            )
             return last_completed_task_id, last_completed_checkpoint, False
 
         logger.info("No existing checkpoints found")
@@ -528,7 +574,9 @@ class ContinualLearningTrainer:
         # Load from checkpoint or prepare new model
         if checkpoint_path:
             logger.info(f"Loading LoRA checkpoint from {checkpoint_path}")
-            model = PeftModel.from_pretrained(base_model, str(checkpoint_path), is_trainable=True)
+            model = PeftModel.from_pretrained(
+                base_model, str(checkpoint_path), is_trainable=True
+            )
             # Ensure model is in training mode and gradients are enabled
             model.train()
             # Enable gradient checkpointing if using quantization
@@ -587,8 +635,8 @@ class ContinualLearningTrainer:
 
         # Check for cached tokenized dataset
         cache_path = self.cache_dir / dataset_name
-
-        if cache_path.exists():
+        # if cache_path.exists():
+        if False:
             logger.info(f"Loading cached tokenized dataset from: {cache_path}")
             try:
                 tokenized_dataset = load_from_disk(str(cache_path))
@@ -611,13 +659,9 @@ class ContinualLearningTrainer:
         )
 
         def format_instruction(examples):
-            # Don't add EOS here - will be added explicitly during tokenization
-            texts = [
-                prompt + answer
-                for prompt, answer in zip(examples["prompt"], examples["answer"])
-            ]
-            # Keep 'answer' field for dynamic masking in collator
-            return {"text": texts, "answer": examples["answer"]}
+            # Keep both prompt and answer fields for DataCollator
+            # DataCollator will handle tokenization and proper label masking
+            return {"prompt": examples["prompt"], "answer": examples["answer"]}
 
         logger.info(f"Formatting dataset: {dataset_name}")
         logger.info(f"Dataset splits: {list(dataset.keys())}")
@@ -627,62 +671,19 @@ class ContinualLearningTrainer:
             format_instruction,
             batched=True,
             batch_size=MAP_BATCH_SIZE,
-            remove_columns=["prompt"],  # Keep 'answer' field
+            # Don't remove any columns - DataCollator needs both prompt and answer
         )
         logger.info(f"Formatting completed successfully")
 
-        # Capture tokenizer and max_length to avoid pickling self
-        tokenizer = self.tokenizer
-        max_length = self.max_length
-        bos_token_id = tokenizer.bos_token_id
-        eos_token_id = tokenizer.eos_token_id
-
-        def tokenize_function(examples):
-            # Tokenize without automatic special tokens (TRACE-style)
-            tokenized = tokenizer(
-                examples["text"],
-                truncation=True,
-                max_length=max_length - 2,  # Reserve space for BOS + EOS
-                add_special_tokens=False,   # Explicit control over special tokens
-                padding=False
-            )
-
-            # Manually add BOS and EOS tokens to each sequence
-            result_ids = []
-            result_mask = []
-            for ids, mask in zip(tokenized["input_ids"], tokenized["attention_mask"]):
-                # Add EOS token if space available
-                if len(ids) < max_length - 1:
-                    ids.append(eos_token_id)
-                    mask.append(1)
-                # Prepend BOS token if space available
-                if len(ids) < max_length:
-                    ids = [bos_token_id] + ids
-                    mask = [1] + mask
-                result_ids.append(ids)
-                result_mask.append(mask)
-
-            return {
-                "input_ids": result_ids,
-                "attention_mask": result_mask,
-                "answer": examples["answer"],
-            }
-
-        logger.info(f"Tokenizing dataset: {dataset_name}")
-        tokenized_dataset = formatted_dataset.map(
-            tokenize_function,
-            batched=True,
-            batch_size=MAP_BATCH_SIZE,
-            remove_columns=["text"],  # Keep 'answer' field for collator
-        )
-        logger.info(f"Tokenization completed successfully")
+        # DataCollator will handle tokenization on-the-fly during training
+        # This is slower but ensures correct label alignment (no context-dependent tokenization bugs)
 
         # Save to cache for future use
-        logger.info(f"Saving tokenized dataset to cache: {cache_path}")
-        tokenized_dataset.save_to_disk(str(cache_path))
+        logger.info(f"Saving formatted dataset to cache: {cache_path}")
+        formatted_dataset.save_to_disk(str(cache_path))
 
         logger.info(f"Dataset {dataset_name} prepared successfully")
-        return tokenized_dataset
+        return formatted_dataset
 
     def data_collator_with_prompt_masking(self, features):
         """
@@ -757,7 +758,7 @@ class ContinualLearningTrainer:
         num_epochs: int,
         batch_size: Optional[int] = None,
         replay_dataset: Optional[Dataset] = None,
-        resume_from_checkpoint: Optional[Path] = None
+        resume_from_checkpoint: Optional[Path] = None,
     ) -> None:
         """
         Train the model on a dataset, optionally adding replay samples.
@@ -780,7 +781,8 @@ class ContinualLearningTrainer:
         ), "Tokenizer not initialized. Call setup_model_and_tokenizer first."
 
         # Use task-specific batch size if provided, otherwise use default
-        effective_batch_size = batch_size if batch_size is not None else self.batch_size
+        # effective_batch_size = batch_size if batch_size is not None else self.batch_size
+        effective_batch_size = min(batch_size or self.batch_size, self.batch_size)
 
         # Prepare training dataset with optional replay addition
         train_dataset = tokenized_dataset["train"]
@@ -797,11 +799,15 @@ class ContinualLearningTrainer:
             replay_size = len(replay_dataset)
 
             logger.info(f"Mixed dataset composition:")
-            logger.info(f"  - Current task: {current_task_size} samples (100% of task data)")
+            logger.info(
+                f"  - Current task: {current_task_size} samples (100% of task data)"
+            )
             logger.info(f"  - Replay buffer: {replay_size} samples (added on top)")
 
             # Concatenate full datasets and shuffle for better mixing
-            train_dataset = concatenate_datasets([train_dataset, replay_dataset]).shuffle(seed=42)
+            train_dataset = concatenate_datasets(
+                [train_dataset, replay_dataset]
+            ).shuffle(seed=42)
 
             logger.info(f"Total training dataset size: {len(train_dataset)} samples")
             logger.info(f"  ({current_task_size} new + {replay_size} replay)")
@@ -809,7 +815,9 @@ class ContinualLearningTrainer:
         else:
             logger.info(f"Training on current task only ({len(train_dataset)} samples)")
 
-        logger.info(f"Starting training for {num_epochs} epochs with batch size {effective_batch_size}...")
+        logger.info(
+            f"Starting training for {num_epochs} epochs with batch size {effective_batch_size}..."
+        )
 
         training_args = TrainingArguments(
             output_dir=str(self.training_output_dir),
@@ -825,14 +833,24 @@ class ContinualLearningTrainer:
             lr_scheduler_type="cosine",
             max_grad_norm=1.0,
             gradient_checkpointing=True,
-            remove_unused_columns=False,  # Keep 'answer' field for data collator
+            remove_unused_columns=False,  # Keep 'prompt' and 'answer' fields for DataCollator
+        )
+
+        # Use original DataCollator for correct label alignment
+        # This fixes the context-dependent tokenization bug in the custom collator
+        data_collator = DataCollator(
+            tokenizer=self.tokenizer,
+            max_prompt_len=self.max_prompt_len,
+            max_ans_len=self.max_ans_len,
+            pad_to_multiple_of=1,
+            inference=False,
         )
 
         trainer = Trainer(
             model=self.model,
             args=training_args,
             train_dataset=train_dataset,
-            data_collator=self.data_collator_with_prompt_masking,
+            data_collator=data_collator,
         )
 
         # Resume from checkpoint if provided (restores optimizer, scheduler, epoch counter)
@@ -889,7 +907,9 @@ class ContinualLearningTrainer:
         is_partial_task_resume = False
 
         if auto_resume:
-            last_task_id, checkpoint_path, is_intermediate = self.find_last_checkpoint(tasks)
+            last_task_id, checkpoint_path, is_intermediate = self.find_last_checkpoint(
+                tasks
+            )
 
             if last_task_id is not None:
                 is_partial_task_resume = is_intermediate
@@ -920,10 +940,14 @@ class ContinualLearningTrainer:
                     if loaded_buffer is not None:
                         self.replay_buffer = loaded_buffer
                         stats = self.replay_buffer.get_stats()
-                        logger.info(f"Replay buffer loaded: {stats['num_tasks']} tasks, "
-                                  f"{stats['total_samples']} samples")
+                        logger.info(
+                            f"Replay buffer loaded: {stats['num_tasks']} tasks, "
+                            f"{stats['total_samples']} samples"
+                        )
                     else:
-                        logger.warning("Could not load replay buffer, starting fresh buffer")
+                        logger.warning(
+                            "Could not load replay buffer, starting fresh buffer"
+                        )
 
                 if start_task_id >= len(tasks):
                     logger.info("All tasks already completed!")
@@ -965,19 +989,25 @@ class ContinualLearningTrainer:
                 # Determine if we should resume from an intermediate checkpoint
                 # Only resume for the first task if we're continuing a partial task
                 resume_checkpoint = None
-                if task_id == start_task_id and is_partial_task_resume and checkpoint_path:
+                if (
+                    task_id == start_task_id
+                    and is_partial_task_resume
+                    and checkpoint_path
+                ):
                     # Find the latest intermediate checkpoint in checkpoints/ directory
                     resume_checkpoint = self.find_intermediate_checkpoint()
                     if resume_checkpoint:
-                        logger.info(f"Will resume training from intermediate checkpoint: {resume_checkpoint}")
+                        logger.info(
+                            f"Will resume training from intermediate checkpoint: {resume_checkpoint}"
+                        )
 
                 # Train (use task-specific batch size if provided)
                 self.train_model(
                     tokenized_dataset,
                     num_epochs=task.num_epochs,
-                    batch_size=task.batch_size,
+                    batch_size=task.max_batch_size,
                     replay_dataset=replay_dataset,
-                    resume_from_checkpoint=resume_checkpoint
+                    resume_from_checkpoint=resume_checkpoint,
                 )
 
                 # Add samples from current task to replay buffer BEFORE saving checkpoint
@@ -986,7 +1016,7 @@ class ContinualLearningTrainer:
                     self.replay_buffer.add_task_samples(
                         task_id=task_id,
                         dataset=tokenized_dataset["train"],
-                        task_name=task.dataset_name
+                        task_name=task.dataset_name,
                     )
                     # Save replay buffer after each task
                     self.replay_buffer.save(self.replay_buffer_dir)
@@ -1105,6 +1135,13 @@ Examples:
         default=0.3,
         help="(Deprecated) No longer used. Replay samples are added on top of full task data.",
     )
+    parser.add_argument(
+        "--task",
+        action="append",
+        required=True,
+        choices=DEFAULT_TASK_CONFIGS.keys(),
+        help="Can be passed multiple times.",
+    )
 
     args = parser.parse_args()
 
@@ -1123,16 +1160,20 @@ Examples:
     #     Task(dataset_name='20Minuten', num_epochs=7, batch_size=32),
     # ]
     # H200
-    tasks = [
-        # Task(dataset_name='C-STANCE', num_epochs=5),
-        Task(dataset_name='MeetingBank', num_epochs=7, batch_size=64), # 7 epochs
-        Task(dataset_name="FOMC", num_epochs=3),
-        Task(dataset_name='Py150', num_epochs=5, batch_size=64),
-        Task(dataset_name='ScienceQA', num_epochs=3, batch_size=128),
-        Task(dataset_name='NumGLUE-cm', num_epochs=5),
-        Task(dataset_name='NumGLUE-ds', num_epochs=5),
-        Task(dataset_name='20Minuten', num_epochs=7, batch_size=64),
-    ]
+    # tasks = [
+    #     # Task(dataset_name='C-STANCE', num_epochs=5),
+    #     Task(dataset_name='MeetingBank', num_epochs=7, max_batch_size=64), # 7 epochs
+    #     Task(dataset_name="FOMC", num_epochs=3),
+    #     Task(dataset_name='Py150', num_epochs=5, max_batch_size=64),
+    #     Task(dataset_name='ScienceQA', num_epochs=3, max_batch_size=128),
+    #     Task(dataset_name='NumGLUE-cm', num_epochs=5),
+    #     Task(dataset_name='NumGLUE-ds', num_epochs=5),
+    #     Task(dataset_name='20Minuten', num_epochs=7, max_batch_size=64),
+    # ]
+    tasks = []
+    for name in args.task:
+        cfg = DEFAULT_TASK_CONFIGS[name]
+        tasks.append(Task(dataset_name=name, **cfg))
 
     logger.info("=" * 80)
     logger.info("CONTINUAL LEARNING TRAINING")
@@ -1154,16 +1195,21 @@ Examples:
         logger.info(f"Experience Replay: ENABLED (Additive Mode)")
         logger.info(f"  - Samples stored per task: {args.replay_samples_per_task}")
         logger.info(f"  - Mode: All replay samples added on top of full task data")
-        logger.info(f"  - Growth: Task dataset increases by ~{args.replay_samples_per_task} samples per task")
+        logger.info(
+            f"  - Growth: Task dataset increases by ~{args.replay_samples_per_task} samples per task"
+        )
     else:
         logger.info(f"Experience Replay: DISABLED")
-        logger.info(f"  ⚠️  Warning: Catastrophic forgetting will be higher without replay!")
+        logger.info(
+            f"  ⚠️  Warning: Catastrophic forgetting will be higher without replay!"
+        )
     logger.info("=" * 80)
 
     # Initialize trainer
     trainer = ContinualLearningTrainer(
         output_base_dir=args.output_base_dir,
         data_dir=args.data_dir,
+        base_model_name="merged-openllama-3b",
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         use_experience_replay=not args.no_replay,
