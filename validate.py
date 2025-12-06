@@ -40,8 +40,14 @@ from transformers import (
     BitsAndBytesConfig,
 )
 
-from constants import MAX_PROMPT_LEN, MAX_ANS_LEN
+from constants import MAX_PROMPT_LEN, MAX_ANS_LEN, DEFAULT_TASK_CONFIGS
+from data_collator import DataCollator
 from evaluation import run_validation
+
+# Global configuration: Set to True to use merged models, False for LoRA checkpoints
+# - When True: Loads merged models from experiments/merged_models/ directory
+# - When False: Loads base model + LoRA adapter from continual/ directory (backward compatible)
+USE_MERGED_MODELS = True  # Default: False for backward compatibility
 
 # Task sequence for continual learning (must match training.py)
 TASK_SEQUENCE = [
@@ -66,34 +72,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class EvalDataCollator:
-    """Custom data collator for evaluation that preserves source text and labels."""
-
-    def __init__(self, tokenizer, max_prompt_len: int = 512):
-        self.tokenizer = tokenizer
-        self.max_prompt_len = max_prompt_len
-
-    def __call__(self, examples):
-        # Extract prompts and answers
-        prompts = [ex['prompt'] for ex in examples]
-        answers = [ex['answer'] for ex in examples]
-
-        # Tokenize prompts only (for generation)
-        tokenized = self.tokenizer(
-            prompts,
-            truncation=True,
-            max_length=self.max_prompt_len,
-            padding='longest',
-            return_tensors='pt'
-        )
-
-        # Return batch with source text and ground truths preserved
-        return {
-            'input_ids': tokenized['input_ids'],
-            'attention_mask': tokenized['attention_mask'],
-            'sources': prompts,
-            'gts': answers
-        }
+# NOTE: EvalDataCollator removed - now using DataCollator with inference=True
+# This ensures consistent tokenization between training and inference
 
 
 def load_base_model(
@@ -149,49 +129,116 @@ def load_model_from_checkpoint(
     device: str = "cuda"
 ):
     """
-    Load model from a LoRA checkpoint (same config as training.py).
+    Load model from a checkpoint.
+
+    Behavior depends on USE_MERGED_MODELS global variable:
+    - If True: Load merged model directly from checkpoint_path
+    - If False: Load base model + LoRA adapter (old behavior)
 
     Args:
-        checkpoint_path: Path to the LoRA checkpoint
-        base_model_name: Base model identifier
+        checkpoint_path: Path to the checkpoint (merged model or LoRA adapter)
+        base_model_name: Base model identifier (only used when USE_MERGED_MODELS=False)
         use_quantization: Whether to use 4-bit quantization (same as training)
         device: Device to load model on
 
     Returns:
         Tuple of (model, tokenizer)
     """
-    logger.info(f"Loading base model: {base_model_name}")
+    if USE_MERGED_MODELS:
+        # NEW: Load merged model directly
+        logger.info(f"Loading merged model from: {checkpoint_path}")
 
-    # Configure quantization (same as training.py)
-    bnb_config = None
-    if use_quantization:
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
+        # Configure quantization
+        bnb_config = None
+        if use_quantization:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+
+        # Load tokenizer from merged model directory
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint_path, use_fast=False)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+
+        # Load merged model directly (no LoRA adapter needed)
+        model = AutoModelForCausalLM.from_pretrained(
+            str(checkpoint_path),
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        model.eval()
+
+        logger.info("Merged model loaded successfully")
+        return model, tokenizer
+
+    else:
+        # OLD: Load base model + LoRA adapter (existing behavior)
+        logger.info(f"Loading base model: {base_model_name}")
+
+        # Configure quantization (same as training.py)
+        bnb_config = None
+        if use_quantization:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(base_model_name, use_fast=False)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+
+        # Load base model (same as training.py)
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True,
         )
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name, use_fast=False)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
+        # Load LoRA checkpoint
+        logger.info(f"Loading LoRA checkpoint from: {checkpoint_path}")
+        model = PeftModel.from_pretrained(base_model, checkpoint_path)
+        model.eval()
 
-    # Load base model (same as training.py)
-    base_model = AutoModelForCausalLM.from_pretrained(
-        base_model_name,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+        logger.info("Model loaded successfully")
+        return model, tokenizer
 
-    # Load LoRA checkpoint
-    logger.info(f"Loading LoRA checkpoint from: {checkpoint_path}")
-    model = PeftModel.from_pretrained(base_model, checkpoint_path)
-    model.eval()
 
-    logger.info("Model loaded successfully")
-    return model, tokenizer
+def resolve_checkpoint_path(checkpoint_base_dir: str, checkpoint_name: str) -> str:
+    """
+    Resolve checkpoint path based on USE_MERGED_MODELS setting.
+
+    Args:
+        checkpoint_base_dir: Base directory (e.g., "./lora-continual" or "./experiments")
+        checkpoint_name: Checkpoint directory name (e.g., "task_0_MeetingBank")
+
+    Returns:
+        Full path to checkpoint
+    """
+    if USE_MERGED_MODELS:
+        # Look in merged_models subdirectory
+        # If checkpoint_base_dir is "./lora-continual", convert to "./experiments/merged_models"
+        if "lora-continual" in checkpoint_base_dir or "continual" in checkpoint_base_dir:
+            # Replace continual with merged_models
+            base_dir = Path(checkpoint_base_dir).parent / "merged_models"
+        else:
+            # Assume checkpoint_base_dir already points to experiments or similar
+            base_dir = Path(checkpoint_base_dir) / "merged_models"
+
+        checkpoint_path = base_dir / checkpoint_name
+    else:
+        # OLD: Use continual directory
+        checkpoint_path = Path(checkpoint_base_dir) / checkpoint_name
+
+    logger.info(f"Resolved checkpoint path: {checkpoint_path}")
+    return str(checkpoint_path)
 
 
 def validate_base_model(
@@ -244,8 +291,15 @@ def validate_base_model(
         },
     )
 
-    # Create dataloader
-    eval_collator = EvalDataCollator(tokenizer, max_prompt_len=max_prompt_len)
+    # Create dataloader with DataCollator in inference mode (matches training tokenization)
+    eval_collator = DataCollator(
+        tokenizer=tokenizer,
+        max_prompt_len=max_prompt_len,
+        max_ans_len=max_ans_len,
+        pad_to_multiple_of=1,
+        inference=True,
+        task=dataset_name  # Pass task name for dataset-specific handling
+    )
     eval_sampler = SequentialSampler(dataset["eval"])
     eval_dataloader = DataLoader(
         dataset["eval"],
@@ -328,8 +382,15 @@ def validate_checkpoint(
         },
     )
 
-    # Create dataloader
-    eval_collator = EvalDataCollator(tokenizer, max_prompt_len=max_prompt_len)
+    # Create dataloader with DataCollator in inference mode (matches training tokenization)
+    eval_collator = DataCollator(
+        tokenizer=tokenizer,
+        max_prompt_len=max_prompt_len,
+        max_ans_len=max_ans_len,
+        pad_to_multiple_of=1,
+        inference=True,
+        task=dataset_name  # Pass task name for dataset-specific handling
+    )
     eval_sampler = SequentialSampler(dataset["eval"])
     eval_dataloader = DataLoader(
         dataset["eval"],
@@ -387,7 +448,17 @@ def validate_all_checkpoints(
         include_base_model: If True, also evaluate base model on all datasets (only with continual_learning=True)
         **kwargs: Additional arguments passed to validate_checkpoint
     """
-    checkpoint_base = Path(checkpoint_base_dir)
+    # Resolve checkpoint base directory based on USE_MERGED_MODELS
+    if USE_MERGED_MODELS:
+        # Convert to merged_models directory
+        if "lora-continual" in checkpoint_base_dir or "continual" in checkpoint_base_dir:
+            checkpoint_base = Path(checkpoint_base_dir).parent / "merged_models"
+        else:
+            checkpoint_base = Path(checkpoint_base_dir) / "merged_models"
+        logger.info(f"Using merged models directory: {checkpoint_base}")
+    else:
+        checkpoint_base = Path(checkpoint_base_dir)
+        logger.info(f"Using LoRA checkpoints directory: {checkpoint_base}")
 
     # Find all checkpoint directories
     checkpoints = sorted([d for d in checkpoint_base.iterdir() if d.is_dir() and d.name.startswith('task_')])
@@ -728,7 +799,17 @@ def validate_all_on_single_dataset(
         include_base_model: Whether to also evaluate the base model (default: True)
         **kwargs: Additional arguments passed to validate_checkpoint
     """
-    checkpoint_base = Path(checkpoint_base_dir)
+    # Resolve checkpoint base directory based on USE_MERGED_MODELS
+    if USE_MERGED_MODELS:
+        # Convert to merged_models directory
+        if "lora-continual" in checkpoint_base_dir or "continual" in checkpoint_base_dir:
+            checkpoint_base = Path(checkpoint_base_dir).parent / "merged_models"
+        else:
+            checkpoint_base = Path(checkpoint_base_dir) / "merged_models"
+        logger.info(f"Using merged models directory: {checkpoint_base}")
+    else:
+        checkpoint_base = Path(checkpoint_base_dir)
+        logger.info(f"Using LoRA checkpoints directory: {checkpoint_base}")
 
     # Find all checkpoint directories
     checkpoints = sorted([d for d in checkpoint_base.iterdir() if d.is_dir() and d.name.startswith('task_')])
@@ -967,9 +1048,17 @@ Examples:
         default=4,
         help="Number of dataloader workers (default: 4)"
     )
+    parser.add_argument(
+        "--task",
+        action="append",
+        required=True,
+        choices=DEFAULT_TASK_CONFIGS.keys(),
+        help="Can be passed multiple times.",
+    )
 
     args = parser.parse_args()
-
+    global TASK_SEQUENCE
+    TASK_SEQUENCE=args.task
     # Determine boolean settings
     continual_learning = not args.no_continual_learning  # Enabled by default
     include_base_model = not args.no_base_model          # Enabled by default
@@ -1028,8 +1117,22 @@ Examples:
         )
     else:
         # Single checkpoint validation
-        checkpoint_path = Path(args.checkpoint_dir)
-        checkpoint_name = checkpoint_path.name
+        checkpoint_path_input = Path(args.checkpoint_dir)
+        checkpoint_name = checkpoint_path_input.name
+
+        # Resolve checkpoint path based on USE_MERGED_MODELS
+        if USE_MERGED_MODELS:
+            # Convert path to merged_models directory
+            checkpoint_dir_str = str(checkpoint_path_input)
+            if "lora-continual" in checkpoint_dir_str or "continual" in checkpoint_dir_str:
+                # Replace continual with merged_models
+                checkpoint_path = checkpoint_path_input.parent.parent / "merged_models" / checkpoint_name
+                logger.info(f"Resolved to merged model path: {checkpoint_path}")
+            else:
+                # Already pointing to correct location or use as-is
+                checkpoint_path = checkpoint_path_input
+        else:
+            checkpoint_path = checkpoint_path_input
 
         # Extract task_id from checkpoint directory name
         # e.g., task_2_MeetingBank -> task_id=2, dataset_name=MeetingBank

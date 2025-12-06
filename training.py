@@ -81,7 +81,8 @@ class Task:
 
 class ExperienceReplayBuffer:
     """
-    Stores representative samples from previous tasks for experience replay.
+    Manages replay buffer metadata for experience replay in continual learning.
+    Generates replay datasets on-demand by loading and sampling from previous task datasets.
     Reduces catastrophic forgetting by rehearsing old examples during new task training.
     """
 
@@ -92,111 +93,153 @@ class ExperienceReplayBuffer:
         Initialize the experience replay buffer.
 
         Args:
-            max_samples_per_task: Maximum number of samples to store per task
-            selection_strategy: Strategy for selecting samples ('random', 'diverse', 'balanced')
+            max_samples_per_task: Maximum number of samples to select per task for replay
+            selection_strategy: Strategy for selecting samples ('random', 'first')
         """
         self.max_samples_per_task = max_samples_per_task
         self.selection_strategy = selection_strategy
-        self.buffer: Dict[int, Dataset] = {}  # task_id -> Dataset of stored samples
-        self.task_info: Dict[int, Dict] = {}  # task_id -> metadata
+        # Only store metadata about completed tasks, not actual samples
+        self.task_info: Dict[int, Dict] = {}  # task_id -> {"task_id": int, "dataset_name": str}
 
-    def add_task_samples(self, task_id: int, dataset: Dataset, task_name: str) -> None:
+    def register_completed_task(self, task_id: int, dataset_name: str) -> None:
         """
-        Store representative samples from a completed task.
+        Register a completed task for future replay generation.
+        Called at END of task (after checkpoint save).
 
         Args:
             task_id: ID of the completed task
-            dataset: Full training dataset from the task
-            task_name: Name of the task for logging
+            dataset_name: Name of the dataset (e.g., "MeetingBank", "FOMC")
         """
-        num_samples = min(self.max_samples_per_task, len(dataset))
-
-        logger.info(
-            f"Adding {num_samples} samples from task {task_id} ({task_name}) to replay buffer"
-        )
-
-        if self.selection_strategy == "random":
-            # Randomly sample from the dataset
-            indices = random.sample(range(len(dataset)), num_samples)
-            selected_samples = dataset.select(indices)
-        elif self.selection_strategy == "first":
-            # Take first N samples (deterministic, useful for debugging)
-            selected_samples = dataset.select(range(num_samples))
-        else:
-            # Default to random
-            indices = random.sample(range(len(dataset)), num_samples)
-            selected_samples = dataset.select(indices)
-
-        self.buffer[task_id] = selected_samples
         self.task_info[task_id] = {
-            "task_name": task_name,
-            "num_samples": num_samples,
-            "total_dataset_size": len(dataset),
+            "task_id": task_id,
+            "dataset_name": dataset_name,
         }
 
         logger.info(
-            f"✓ Replay buffer now contains {len(self.buffer)} tasks, "
-            f"total samples: {sum(len(ds) for ds in self.buffer.values())}"
+            f"✓ Registered task {task_id} ({dataset_name}) for replay buffer"
+        )
+        logger.info(
+            f"  Replay buffer now tracks {len(self.task_info)} completed task(s)"
         )
 
-    def get_replay_dataset(self, current_task_id: int) -> Optional[Dataset]:
+    def get_replay_dataset(
+        self,
+        current_task_id: int,
+        data_dir: Path,
+        max_prompt_len: int,
+        max_ans_len: int,
+    ) -> Optional[Dataset]:
         """
-        Get combined dataset from all previous tasks for replay.
+        Generate replay dataset by loading and sampling from all previous tasks.
+        Called at START of current task (before training).
 
         Args:
             current_task_id: ID of the current task being trained
+            data_dir: Directory containing task datasets
+            max_prompt_len: Maximum prompt length for formatting
+            max_ans_len: Maximum answer length for formatting
 
         Returns:
-            Combined dataset from all previous tasks, or None if no previous tasks
+            Combined dataset of replay samples from all previous tasks, or None if first task
         """
-        if current_task_id == 0 or len(self.buffer) == 0:
+        if current_task_id == 0:
+            logger.info("Task 0: No replay buffer (first task)")
             return None
 
-        # Collect all samples from previous tasks
+        if len(self.task_info) == 0:
+            logger.warning(
+                f"No completed tasks registered in replay buffer for task {current_task_id}"
+            )
+            return None
+
+        logger.info("=" * 80)
+        logger.info(f"GENERATING REPLAY BUFFER FOR TASK {current_task_id}")
+        logger.info("=" * 80)
+
         replay_datasets = []
-        for task_id in range(current_task_id):
-            if task_id in self.buffer:
-                replay_datasets.append(self.buffer[task_id])
+        for prev_task_id in range(current_task_id):
+            if prev_task_id not in self.task_info:
+                logger.warning(
+                    f"  Task {prev_task_id} not found in replay buffer metadata, skipping..."
+                )
+                continue
+
+            # Get dataset name from metadata
+            dataset_name = self.task_info[prev_task_id]["dataset_name"]
+
+            logger.info(f"  Loading Task {prev_task_id} ({dataset_name}) for replay...")
+
+            # Load the dataset from original source
+            try:
+                dataset = load_dataset(
+                    "json",
+                    data_files={
+                        "train": str(data_dir / dataset_name / "train.json"),
+                    },
+                )["train"]
+
+                logger.info(f"    Dataset loaded: {len(dataset)} samples")
+
+                # Format (same as get_tokenized_dataset)
+                def format_instruction(examples):
+                    return {"prompt": examples["prompt"], "answer": examples["answer"]}
+
+                MAP_BATCH_SIZE = 10000
+                formatted = dataset.map(
+                    format_instruction,
+                    batched=True,
+                    batch_size=MAP_BATCH_SIZE,
+                )
+
+                # Sample N examples according to selection strategy
+                num_samples = min(self.max_samples_per_task, len(formatted))
+
+                if self.selection_strategy == "random":
+                    indices = random.sample(range(len(formatted)), num_samples)
+                    selected = formatted.select(indices)
+                elif self.selection_strategy == "first":
+                    selected = formatted.select(range(num_samples))
+                else:
+                    # Default to random
+                    indices = random.sample(range(len(formatted)), num_samples)
+                    selected = formatted.select(indices)
+
+                replay_datasets.append(selected)
+                logger.info(f"    ✓ Sampled {num_samples} examples from Task {prev_task_id}")
+
+            except Exception as e:
+                logger.error(
+                    f"    ✗ Failed to load dataset {dataset_name} for replay: {e}"
+                )
+                logger.error(f"    Skipping Task {prev_task_id} from replay buffer")
+                continue
 
         if not replay_datasets:
+            logger.warning(
+                "  No replay datasets could be loaded. Training without replay."
+            )
             return None
 
-        # Concatenate all replay datasets
-        combined_replay = concatenate_datasets(replay_datasets)
+        # Combine all replay datasets
+        combined = concatenate_datasets(replay_datasets)
 
-        logger.info(
-            f"Replay dataset contains {len(combined_replay)} samples "
-            f"from {len(replay_datasets)} previous task(s)"
-        )
+        logger.info("=" * 80)
+        logger.info(f"✓ REPLAY BUFFER READY")
+        logger.info(f"  Total samples: {len(combined)} from {len(replay_datasets)} task(s)")
+        logger.info(f"  Breakdown: {', '.join([f'Task {i}: {len(ds)}' for i, ds in enumerate(replay_datasets)])}")
+        logger.info("=" * 80)
 
-        return combined_replay
+        return combined
 
-    def save(self, path: Path) -> None:
+    def save_metadata(self, path: Path) -> None:
         """
-        Save the replay buffer to disk for resume functionality.
+        Save only task metadata (dataset names), not actual samples.
 
         Args:
-            path: Directory path to save the buffer
+            path: Directory path to save the metadata
         """
-        import shutil
-
         path.mkdir(parents=True, exist_ok=True)
 
-        # Save buffer datasets
-        for task_id, dataset in self.buffer.items():
-            dataset_path = path / f"task_{task_id}_replay"
-
-            # Remove existing directory if it exists to avoid "can't overwrite itself" error
-            # This happens when resuming training and the dataset was loaded from this location
-            if dataset_path.exists():
-                shutil.rmtree(dataset_path)
-
-            # Create a fresh copy of the dataset to avoid memory-mapped references
-            # that prevent overwriting the same path
-            dataset_copy = dataset.map(lambda x: x, keep_in_memory=False, load_from_cache_file=False)
-            dataset_copy.save_to_disk(str(dataset_path))
-
-        # Save metadata
         metadata = {
             "max_samples_per_task": self.max_samples_per_task,
             "selection_strategy": self.selection_strategy,
@@ -206,18 +249,19 @@ class ExperienceReplayBuffer:
         with open(metadata_path, "wb") as f:
             pickle.dump(metadata, f)
 
-        logger.info(f"✓ Replay buffer saved to {path}")
+        logger.info(f"✓ Replay buffer metadata saved to {path}")
+        logger.info(f"  Tracks {len(self.task_info)} completed task(s)")
 
     @classmethod
-    def load(cls, path: Path) -> Optional["ExperienceReplayBuffer"]:
+    def load_metadata(cls, path: Path) -> Optional["ExperienceReplayBuffer"]:
         """
-        Load the replay buffer from disk.
+        Load task metadata for replay generation.
 
         Args:
-            path: Directory path containing the saved buffer
+            path: Directory path containing the saved metadata
 
         Returns:
-            Loaded ExperienceReplayBuffer or None if path doesn't exist
+            ExperienceReplayBuffer with loaded metadata, or None if not found
         """
         if not path.exists():
             return None
@@ -228,35 +272,24 @@ class ExperienceReplayBuffer:
             return None
 
         try:
-            # Load metadata
             with open(metadata_path, "rb") as f:
                 metadata = pickle.load(f)
 
-            # Create buffer instance
             buffer = cls(
                 max_samples_per_task=metadata["max_samples_per_task"],
                 selection_strategy=metadata["selection_strategy"],
             )
             buffer.task_info = metadata["task_info"]
 
-            # Load datasets
-            for task_id in buffer.task_info.keys():
-                dataset_path = path / f"task_{task_id}_replay"
-                if dataset_path.exists():
-                    buffer.buffer[task_id] = load_from_disk(str(dataset_path))
-                else:
-                    logger.warning(f"Missing replay dataset for task {task_id}")
-
-            total_samples = sum(len(ds) for ds in buffer.buffer.values())
             logger.info(
-                f"✓ Replay buffer loaded from {path} "
-                f"({len(buffer.buffer)} tasks, {total_samples} samples)"
+                f"✓ Replay buffer metadata loaded from {path} "
+                f"({len(buffer.task_info)} tasks tracked)"
             )
 
             return buffer
 
         except Exception as e:
-            logger.error(f"Failed to load replay buffer: {e}")
+            logger.error(f"Failed to load replay buffer metadata: {e}")
             return None
 
     def get_stats(self) -> Dict:
@@ -305,6 +338,7 @@ class ContinualLearningTrainer:
             replay_mix_ratio: (Deprecated - kept for compatibility) All replay samples are now added on top
         """
         self.base_model_name = base_model_name
+        self.current_base_model_path: str = base_model_name  # Tracks base model (original or merged)
         self.output_base_dir = Path(output_base_dir)
         self.output_dir = self.output_base_dir / "continual"  # Task checkpoints
         self.training_output_dir = (
@@ -313,6 +347,9 @@ class ContinualLearningTrainer:
         self.replay_buffer_dir = (
             self.output_base_dir / "replay_buffer"
         )  # Replay buffer storage
+        self.merged_models_dir = (
+            self.output_base_dir / "merged_models"
+        )  # Merged models (LoRA + base)
         self.data_dir = Path(data_dir)
 
         # Create cache dir using both prompt and answer lengths for uniqueness
@@ -346,11 +383,15 @@ class ContinualLearningTrainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.training_output_dir.mkdir(parents=True, exist_ok=True)
         self.replay_buffer_dir.mkdir(parents=True, exist_ok=True)
+        self.merged_models_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def save_training_state(self, task_id: int, task_name: str) -> None:
         """
         Save current training state to track partial task completions.
+
+        Includes base_model_path to ensure intermediate checkpoint resume
+        uses the correct base model.
 
         Args:
             task_id: Current task ID being trained
@@ -360,11 +401,15 @@ class ContinualLearningTrainer:
         state = {
             "task_id": task_id,
             "task_name": task_name,
+            "base_model_path": self.current_base_model_path,  # Track base model for resume
             "timestamp": str(time.time()),
         }
         with open(state_path, "w") as f:
             json.dump(state, f, indent=2)
-        logger.debug(f"Saved training state: task {task_id} ({task_name})")
+        logger.debug(
+            f"Saved training state: task {task_id} ({task_name}), "
+            f"base: {self.current_base_model_path}"
+        )
 
     def load_training_state(self) -> Optional[Dict]:
         """
@@ -437,7 +482,7 @@ class ContinualLearningTrainer:
 
     def find_last_checkpoint(
         self, tasks: List[Task]
-    ) -> Tuple[Optional[int], Optional[Path], bool]:
+    ) -> Tuple[Optional[int], Optional[Path], bool, Optional[str]]:
         """
         Find the last successful checkpoint, including intermediate checkpoints.
 
@@ -445,10 +490,11 @@ class ContinualLearningTrainer:
             tasks: List of Task objects
 
         Returns:
-            Tuple of (task_id, checkpoint_path, is_intermediate):
+            Tuple of (task_id, checkpoint_path, is_intermediate, base_model_path):
             - task_id: ID of the task to resume
             - checkpoint_path: Path to the checkpoint
             - is_intermediate: True if resuming from intermediate checkpoint (partial task)
+            - base_model_path: Path to base model to use (original or merged)
         """
         logger.info("Searching for existing checkpoints...")
 
@@ -502,7 +548,14 @@ class ContinualLearningTrainer:
                         logger.info(
                             f"Intermediate checkpoint: {intermediate_checkpoint}"
                         )
-                        return partial_task_id, intermediate_checkpoint, True
+                        # Get base model path from training state (for intermediate resume)
+                        base_model_path = training_state.get(
+                            "base_model_path", self.base_model_name
+                        )
+                        logger.info(
+                            f"Will use base model from training state: {base_model_path}"
+                        )
+                        return partial_task_id, intermediate_checkpoint, True, base_model_path
                     else:
                         logger.warning(
                             f"Intermediate checkpoint {intermediate_checkpoint} is incomplete, ignoring"
@@ -527,10 +580,27 @@ class ContinualLearningTrainer:
             logger.info(
                 f"Will resume from next task after completed task {last_completed_task_id}"
             )
-            return last_completed_task_id, last_completed_checkpoint, False
+
+            # Check for merged model from the completed task
+            task = tasks[last_completed_task_id]
+            merged_model_path = (
+                self.merged_models_dir / f"task_{last_completed_task_id}_{task.dataset_name}"
+            )
+
+            if merged_model_path.exists():
+                logger.info(f"Found merged model for next task: {merged_model_path}")
+                base_model_path = str(merged_model_path)
+            else:
+                logger.warning(
+                    f"No merged model found for task {last_completed_task_id}. "
+                    f"Using original base model."
+                )
+                base_model_path = self.base_model_name
+
+            return last_completed_task_id, last_completed_checkpoint, False, base_model_path
 
         logger.info("No existing checkpoints found")
-        return None, None, False
+        return None, None, False, None
 
     def setup_model_and_tokenizer(
         self, checkpoint_path: Optional[Path] = None, use_quantization: bool = True
@@ -538,11 +608,16 @@ class ContinualLearningTrainer:
         """
         Load model and tokenizer, optionally from a checkpoint.
 
+        For progressive merging:
+        - First task: Uses original base model
+        - Later tasks: Uses merged model from previous task
+
         Args:
             checkpoint_path: Path to LoRA checkpoint to resume from
             use_quantization: Whether to use 4-bit quantization
         """
         logger.info("Setting up model and tokenizer...")
+        logger.info(f"Base model path: {self.current_base_model_path}")
 
         # Configure quantization
         bnb_config = None
@@ -554,17 +629,19 @@ class ContinualLearningTrainer:
                 bnb_4bit_use_double_quant=True,
             )
 
-        # Load tokenizer
-        logger.info(f"Loading tokenizer from {self.base_model_name}")
-        tokenizer = AutoTokenizer.from_pretrained(self.base_model_name, use_fast=False)
+        # Load tokenizer from current base model (original or merged)
+        logger.info(f"Loading tokenizer from {self.current_base_model_path}")
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.current_base_model_path, use_fast=False
+        )
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
         self.tokenizer = tokenizer
 
-        # Load base model
-        logger.info(f"Loading base model from {self.base_model_name}")
+        # Load base model (original or merged from previous task)
+        logger.info(f"Loading base model from {self.current_base_model_path}")
         base_model = AutoModelForCausalLM.from_pretrained(
-            self.base_model_name,
+            self.current_base_model_path,
             quantization_config=bnb_config,
             dtype=torch.bfloat16,
             device_map="auto",
@@ -863,29 +940,149 @@ class ContinualLearningTrainer:
 
     def save_checkpoint(self, task_id: int, dataset_name: str) -> Path:
         """
-        Save model checkpoint.
+        Save model checkpoint including LoRA adapter and merged model.
+
+        This method:
+        1. Saves LoRA adapter to continual/task_{id}_{dataset}/
+        2. Merges LoRA into base model and saves to merged_models/task_{id}_{dataset}/
+        3. Updates current_base_model_path for next task
 
         Args:
             task_id: Task ID number
             dataset_name: Name of the dataset
 
         Returns:
-            Path to saved checkpoint
+            Path to saved LoRA checkpoint
         """
         assert self.model is not None, "Model not initialized."
         assert self.tokenizer is not None, "Tokenizer not initialized."
 
+        # Step 1: Save LoRA adapter (existing behavior)
         checkpoint_path = self.output_dir / f"task_{task_id}_{dataset_name}"
-        logger.info(f"Saving checkpoint to {checkpoint_path}")
+        logger.info(f"Saving LoRA checkpoint to {checkpoint_path}")
 
         self.model.save_pretrained(str(checkpoint_path))
         self.tokenizer.save_pretrained(str(checkpoint_path))
+        logger.info("✓ LoRA checkpoint saved")
 
-        # Clear training state after successful checkpoint save
+        # Step 2: Merge and save merged model (NEW)
+        logger.info(f"Merging LoRA into base model for task {task_id}...")
+        merged_path = self.merge_and_save_model(task_id, dataset_name)
+
+        # Step 3: Update base model path for next task (NEW)
+        if merged_path:
+            logger.info(f"✓ Merged model saved to {merged_path}")
+            # Update base model path for next task
+            self.current_base_model_path = str(merged_path)
+            logger.info(
+                f"Next task will use merged model: {self.current_base_model_path}"
+            )
+        else:
+            logger.warning(
+                f"⚠ Merge failed for task {task_id}. Next task will use "
+                f"current base: {self.current_base_model_path}"
+            )
+
+        # Step 4: Clear training state (existing behavior)
         self.clear_training_state()
 
         logger.info(f"Checkpoint saved successfully")
         return checkpoint_path
+
+    def merge_and_save_model(
+        self, task_id: int, dataset_name: str
+    ) -> Optional[Path]:
+        """
+        Merge current LoRA adapter into base model and save merged model.
+
+        This implements progressive merging: each task's merged model becomes
+        the base for the next task.
+
+        Process:
+        1. Load base model in full precision (bfloat16, no quantization)
+        2. Load current LoRA adapter from the saved checkpoint
+        3. Merge LoRA weights into base model
+        4. Save merged model to merged_models/task_{id}_{dataset}/
+        5. Save tokenizer
+        6. Clean up GPU memory
+
+        Args:
+            task_id: Current task ID
+            dataset_name: Current task dataset name
+
+        Returns:
+            Path to saved merged model, or None if merge failed
+        """
+        try:
+            merged_model_path = self.merged_models_dir / f"task_{task_id}_{dataset_name}"
+            logger.info("=" * 80)
+            logger.info(f"MERGING LORA ADAPTER FOR TASK {task_id}")
+            logger.info(f"Base model: {self.current_base_model_path}")
+            logger.info(f"Output path: {merged_model_path}")
+            logger.info("=" * 80)
+
+            # Step 1: Load base model in full precision (no quantization)
+            logger.info("Loading base model in full precision for merging...")
+            base_model_for_merge = AutoModelForCausalLM.from_pretrained(
+                self.current_base_model_path,
+                torch_dtype=torch.bfloat16,  # Always bfloat16 for merged models
+                device_map="auto",
+                trust_remote_code=True,
+            )
+            logger.info("✓ Base model loaded")
+
+            # Step 2: Load current LoRA adapter
+            # Get LoRA checkpoint path for this task
+            lora_checkpoint_path = self.output_dir / f"task_{task_id}_{dataset_name}"
+            logger.info(f"Loading LoRA adapter from {lora_checkpoint_path}")
+
+            # Load LoRA onto base model
+            model_with_lora = PeftModel.from_pretrained(
+                base_model_for_merge,
+                str(lora_checkpoint_path),
+                is_trainable=False,  # Not training, just merging
+            )
+            logger.info("✓ LoRA adapter loaded")
+
+            # Step 3: Merge LoRA weights into base model
+            logger.info("Merging LoRA weights into base model...")
+            merged_model = model_with_lora.merge_and_unload()
+            logger.info("✓ Merge complete")
+
+            # Step 4: Save merged model
+            logger.info(f"Saving merged model to {merged_model_path}")
+            merged_model_path.mkdir(parents=True, exist_ok=True)
+            merged_model.save_pretrained(str(merged_model_path))
+            logger.info("✓ Merged model saved")
+
+            # Step 5: Save tokenizer (copy from current tokenizer)
+            logger.info("Saving tokenizer...")
+            self.tokenizer.save_pretrained(str(merged_model_path))
+            logger.info("✓ Tokenizer saved")
+
+            # Step 6: Clean up GPU memory
+            del base_model_for_merge
+            del model_with_lora
+            del merged_model
+            torch.cuda.empty_cache()
+
+            logger.info("=" * 80)
+            logger.info(f"✓ MERGE SUCCESSFUL FOR TASK {task_id}")
+            logger.info(f"Merged model size: ~6.4GB")
+            logger.info(f"This will be the base model for task {task_id + 1}")
+            logger.info("=" * 80)
+
+            return merged_model_path
+
+        except Exception as e:
+            logger.error("=" * 80)
+            logger.error(f"✗ MERGE FAILED FOR TASK {task_id}")
+            logger.error(f"Error: {type(e).__name__}: {e}")
+            logger.error("=" * 80)
+            logger.error(
+                "LoRA adapter is still saved. Next task will use current base."
+            )
+            return None
 
     def run_continual_learning(
         self,
@@ -905,14 +1102,23 @@ class ContinualLearningTrainer:
         start_task_id = 0
         checkpoint_path = None
         is_partial_task_resume = False
+        base_model_for_next_task = self.base_model_name  # Default: original base
 
         if auto_resume:
-            last_task_id, checkpoint_path, is_intermediate = self.find_last_checkpoint(
-                tasks
-            )
+            (
+                last_task_id,
+                checkpoint_path,
+                is_intermediate,
+                base_model_path,
+            ) = self.find_last_checkpoint(tasks)
 
             if last_task_id is not None:
                 is_partial_task_resume = is_intermediate
+
+                # Update current base model path from checkpoint info
+                if base_model_path:
+                    base_model_for_next_task = base_model_path
+                    logger.info(f"Will use base model: {base_model_for_next_task}")
 
                 if is_intermediate:
                     # Resuming from an intermediate checkpoint (partial task)
@@ -934,19 +1140,19 @@ class ContinualLearningTrainer:
                     logger.info(f"Resuming from task: {start_task_id}")
                     logger.info("=" * 80)
 
-                # Load replay buffer if resuming and replay is enabled
+                # Load replay buffer metadata if resuming and replay is enabled
                 if self.use_experience_replay and self.replay_buffer is not None:
-                    loaded_buffer = ExperienceReplayBuffer.load(self.replay_buffer_dir)
+                    loaded_buffer = ExperienceReplayBuffer.load_metadata(
+                        self.replay_buffer_dir
+                    )
                     if loaded_buffer is not None:
                         self.replay_buffer = loaded_buffer
-                        stats = self.replay_buffer.get_stats()
                         logger.info(
-                            f"Replay buffer loaded: {stats['num_tasks']} tasks, "
-                            f"{stats['total_samples']} samples"
+                            f"Replay buffer metadata loaded: {len(self.replay_buffer.task_info)} tasks tracked"
                         )
                     else:
                         logger.warning(
-                            "Could not load replay buffer, starting fresh buffer"
+                            "Could not load replay buffer metadata, starting fresh buffer"
                         )
 
                 if start_task_id >= len(tasks):
@@ -961,7 +1167,10 @@ class ContinualLearningTrainer:
             logger.info("STARTING FRESH (auto-resume disabled)")
             logger.info("=" * 80)
 
-        # Setup model
+        # Set current base model path for first task
+        self.current_base_model_path = base_model_for_next_task
+
+        # Setup model for first task
         self.setup_model_and_tokenizer(
             checkpoint_path=checkpoint_path, use_quantization=use_quantization
         )
@@ -969,6 +1178,27 @@ class ContinualLearningTrainer:
         # Train on remaining tasks
         for task_id in range(start_task_id, len(tasks)):
             task = tasks[task_id]
+
+            # IMPORTANT: For task_id > start_task_id, reload model with new base
+            # This implements progressive merging: each task uses the merged model from previous task
+            if task_id > start_task_id:
+                logger.info("=" * 80)
+                logger.info(f"RELOADING MODEL FOR TASK {task_id}")
+                logger.info(f"Base model: {self.current_base_model_path}")
+                logger.info("=" * 80)
+
+                # Clean up previous model to free memory
+                if self.model is not None:
+                    del self.model
+                    torch.cuda.empty_cache()
+                    logger.info("Previous model deleted, GPU memory cleared")
+
+                # Load new base (merged model from previous task) + fresh LoRA
+                self.setup_model_and_tokenizer(
+                    checkpoint_path=None,  # Fresh LoRA adapter
+                    use_quantization=use_quantization,
+                )
+                logger.info(f"Model reloaded with base: {self.current_base_model_path}")
 
             logger.info("=" * 80)
             logger.info(f"TASK {task_id}/{len(tasks)-1}: {task}")
@@ -981,10 +1211,15 @@ class ContinualLearningTrainer:
                 # Prepare dataset
                 tokenized_dataset = self.get_tokenized_dataset(task.dataset_name)
 
-                # Get replay dataset from previous tasks if replay is enabled
+                # Generate replay dataset from previous tasks if replay is enabled
                 replay_dataset = None
                 if self.use_experience_replay and self.replay_buffer is not None:
-                    replay_dataset = self.replay_buffer.get_replay_dataset(task_id)
+                    replay_dataset = self.replay_buffer.get_replay_dataset(
+                        current_task_id=task_id,
+                        data_dir=self.data_dir,
+                        max_prompt_len=self.max_prompt_len,
+                        max_ans_len=self.max_ans_len,
+                    )
 
                 # Determine if we should resume from an intermediate checkpoint
                 # Only resume for the first task if we're continuing a partial task
@@ -1010,16 +1245,15 @@ class ContinualLearningTrainer:
                     resume_from_checkpoint=resume_checkpoint,
                 )
 
-                # Add samples from current task to replay buffer BEFORE saving checkpoint
+                # Register completed task for future replay generation
                 # This ensures replay buffer is always consistent with completed checkpoints
                 if self.use_experience_replay and self.replay_buffer is not None:
-                    self.replay_buffer.add_task_samples(
+                    self.replay_buffer.register_completed_task(
                         task_id=task_id,
-                        dataset=tokenized_dataset["train"],
-                        task_name=task.dataset_name,
+                        dataset_name=task.dataset_name,
                     )
-                    # Save replay buffer after each task
-                    self.replay_buffer.save(self.replay_buffer_dir)
+                    # Save replay buffer metadata after each task
+                    self.replay_buffer.save_metadata(self.replay_buffer_dir)
 
                 # Save checkpoint (marks task as officially complete)
                 self.save_checkpoint(task_id, task.dataset_name)
