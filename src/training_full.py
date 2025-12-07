@@ -68,8 +68,6 @@ class FullFineTuningTrainer(ContinualLearningTrainer):
         """
         Find the latest intermediate checkpoint in the checkpoints directory.
 
-        Overrides parent method to check for full model files instead of adapter_config.json.
-
         Returns:
             Path to the latest checkpoint, or None if no checkpoints found
         """
@@ -97,8 +95,6 @@ class FullFineTuningTrainer(ContinualLearningTrainer):
     ) -> Tuple[Optional[int], Optional[Path], bool, str]:
         """
         Find the last successful checkpoint, including intermediate checkpoints.
-
-        Overrides parent method to check for full model files instead of adapter_config.json.
 
         Args:
             tasks: List of Task objects
@@ -175,8 +171,6 @@ class FullFineTuningTrainer(ContinualLearningTrainer):
     ) -> None:
         """
         Load model and tokenizer for full fine-tuning.
-
-        Overrides parent method to load full model instead of LoRA adapters.
 
         Args:
             checkpoint_path: Path to full model checkpoint to resume from

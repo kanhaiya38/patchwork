@@ -905,17 +905,6 @@ class ContinualLearningTrainer:
         """
         Merge current LoRA adapter into base model and save merged model.
 
-        This implements progressive merging: each task's merged model becomes
-        the base for the next task.
-
-        Process:
-        1. Load base model in full precision (bfloat16, no quantization)
-        2. Load current LoRA adapter from the saved checkpoint
-        3. Merge LoRA weights into base model
-        4. Save merged model to merged_models/task_{id}_{dataset}/
-        5. Save tokenizer
-        6. Clean up GPU memory
-
         Args:
             task_id: Current task ID
             dataset_name: Current task dataset name
@@ -1201,23 +1190,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Auto-resume from last checkpoint with experience replay (default)
   python training.py
-
-  # Start fresh, ignoring existing checkpoints
-  python training.py --no-resume
-
-  # Custom output directory
-  python training.py --output-base-dir ./my-experiment
-
-  # Disable experience replay (not recommended)
-  python training.py --no-replay
-
-  # Custom replay configuration (store more samples per task)
-  python training.py --replay-samples-per-task 1000
-
-  # Full custom configuration
-  python training.py --output-base-dir ./my-experiment --batch-size 16 --learning-rate 3e-5 --replay-samples-per-task 800
         """,
     )
 
@@ -1247,18 +1220,18 @@ Examples:
         "--batch-size",
         type=int,
         default=32,
-        help="Training batch size (default: 32, increase to 128+ for H200)",
+        help="Training batch size",
     )
     parser.add_argument(
         "--learning-rate",
         type=float,
         default=5e-5,
-        help="Learning rate (default: 5e-5)",
+        help="Learning rate",
     )
     parser.add_argument(
         "--quantize",
         action="store_true",
-        help="Enable 4-bit quantization (useful for smaller GPUs, slower on H200)",
+        help="Enable 4-bit quantization",
     )
 
     # Experience replay arguments

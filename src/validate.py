@@ -1064,17 +1064,17 @@ Examples:
         "--base-model",
         type=str,
         default="openlm-research/open_llama_3b_v2",
-        help="Base model name (default: openlm-research/open_llama_3b_v2)"
+        help="Base model name"
     )
     parser.add_argument(
         "--use-quantization",
         action="store_true",
-        help="Enable 4-bit quantization (default: disabled)"
+        help="Enable 4-bit quantization"
     )
     parser.add_argument(
         "--pre-quantized",
         action="store_true",
-        help="Models are already quantized (don't apply quantization config during loading)"
+        help="Models are already quantized"
     )
 
     # Generation settings
@@ -1082,19 +1082,19 @@ Examples:
         "--temperature",
         type=float,
         default=0.1,
-        help="Generation temperature (default: 0.1)"
+        help="Generation temperature"
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=32,
-        help="Batch size for inference (default: 32, increase to 64+ for H200)"
+        help="Batch size for inference"
     )
     parser.add_argument(
         "--num-workers",
         type=int,
         default=4,
-        help="Number of dataloader workers (default: 4)"
+        help="Number of dataloader workers"
     )
     parser.add_argument(
         "--task",
