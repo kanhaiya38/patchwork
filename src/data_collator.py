@@ -1,3 +1,4 @@
+# Reference: https://github.com/BeyonderXX/TRACE/blob/master/utils/data/data_collator.py
 import logging
 import torch
 from transformers.data.data_collator import *
