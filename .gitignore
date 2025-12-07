@@ -8,3 +8,4 @@ validation-results
 .cache
 experiments
 TRACE-Benchmark.zip
+training.log
