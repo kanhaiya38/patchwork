@@ -1,33 +1,10 @@
 """
-LoRA Continual Learning Training with Auto-Resume and Experience Replay
-
-This script handles continual learning with:
-- Automatic checkpoint detection and resume (including intermediate checkpoints)
-- Experience replay to reduce catastrophic forgetting (additive mode)
-- Configurable replay buffer size
-- Recovery from partial task completions
-
-Resume Strategy:
-    1. Checks for completed task checkpoints in continual/ directory
-    2. Checks for intermediate checkpoints in checkpoints/ directory (partial task completions)
-    3. Automatically resumes from the most recent checkpoint (completed or intermediate)
-    4. Tracks training state to detect which task was being trained during interruptions
-
-Replay Strategy:
-    Additive approach - All current task samples + replay samples from previous tasks
-    Example: 5000 (current) + 500 (replay) = 5500 total samples per task
+LoRA Continual Learning Training
 
 Usage:
-    # Auto-resume from last checkpoint with experience replay (default)
     python training.py
 
-    # Start fresh (ignore existing checkpoints)
-    python training.py --no-resume
-
-    # Custom replay configuration (store more samples per task)
-    python training.py --replay-samples-per-task 1000
-
-    # Custom output directory
+    # Custom output directory and batch size
     python training.py --output-base-dir ./my-experiment --batch-size 16
 """
 
@@ -43,8 +20,8 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
 import torch
-from constants import MAX_PROMPT_LEN, MAX_ANS_LEN, DEFAULT_TASK_CONFIGS, BASE_MODEL
-from data_collator import DataCollator
+from src.constants import MAX_PROMPT_LEN, MAX_ANS_LEN, DEFAULT_TASK_CONFIGS, BASE_MODEL
+from src.data_collator import DataCollator
 from datasets import load_dataset, load_from_disk, concatenate_datasets, Dataset
 from peft import PeftModel, LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (

@@ -1,5 +1,5 @@
 import json
-from metrics import caculate_bleu, caculate_rouge, caculate_accuracy
+from src.metrics import caculate_bleu, caculate_rouge, caculate_accuracy
 
 
 # resolving answer and reasoning

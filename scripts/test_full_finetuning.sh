@@ -7,6 +7,6 @@ NAME="experiments_full"
 
 # rm -rf .cache
 # rm -rf ./$NAME
-python src/training_full.py --output-base-dir ./$NAME --batch-size ${BATCH_SIZE} --task MeetingBank
+python -m src.training_full --output-base-dir ./$NAME --batch-size ${BATCH_SIZE} --task MeetingBank
 
-python src/validate.py --validate-all ./$NAME --no-base-model
+python -m src.validate --validate-all ./$NAME --no-base-model

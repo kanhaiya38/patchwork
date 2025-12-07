@@ -21,7 +21,7 @@ from pathlib import Path
 import torch
 
 # Add src to path
-sys.path.insert(0, str(Path(__file__).parent / 'src'))
+# sys.path.insert(0, str(Path(__file__).parent / 'src'))
 from constants import MAX_PROMPT_LEN, MAX_ANS_LEN
 from model_loader import ModelLoader
 

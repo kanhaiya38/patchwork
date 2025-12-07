@@ -40,9 +40,9 @@ from transformers import (
     BitsAndBytesConfig,
 )
 
-from constants import MAX_PROMPT_LEN, MAX_ANS_LEN, DEFAULT_TASK_CONFIGS
-from data_collator import DataCollator
-from evaluation import run_validation
+from src.constants import MAX_PROMPT_LEN, MAX_ANS_LEN, DEFAULT_TASK_CONFIGS
+from src.data_collator import DataCollator
+from src.evaluation import run_validation
 
 # Global configuration: Set to True to use merged models, False for LoRA checkpoints
 # - When True: Loads merged models from experiments/merged_models/ directory
@@ -239,6 +239,48 @@ def resolve_checkpoint_path(checkpoint_base_dir: str, checkpoint_name: str) -> s
 
     logger.info(f"Resolved checkpoint path: {checkpoint_path}")
     return str(checkpoint_path)
+
+
+def find_checkpoints(checkpoint_base_dir, task_sequence, use_merged_models=True):
+    """
+    Discover checkpoints for the given task sequence.
+
+    Args:
+        checkpoint_base_dir: Base directory containing checkpoints
+        task_sequence: List of task names in order
+        use_merged_models: If True, look in merged_models subdirectory
+
+    Returns:
+        List of tuples: [(task_id, task_name, checkpoint_path), ...]
+    """
+    # Resolve checkpoint base directory
+    if use_merged_models:
+        if "lora-continual" in checkpoint_base_dir or "continual" in checkpoint_base_dir:
+            checkpoint_base = Path(checkpoint_base_dir).parent / "merged_models"
+        else:
+            checkpoint_base = Path(checkpoint_base_dir) / "merged_models"
+    else:
+        checkpoint_base = Path(checkpoint_base_dir)
+
+    if not checkpoint_base.exists():
+        raise ValueError(f"Checkpoint directory does not exist: {checkpoint_base}")
+
+    checkpoints = []
+
+    for task_id, task_name in enumerate(task_sequence):
+        checkpoint_name = f"task_{task_id}_{task_name}"
+        checkpoint_path = checkpoint_base / checkpoint_name
+
+        if checkpoint_path.exists() and checkpoint_path.is_dir():
+            checkpoints.append((task_id, task_name, str(checkpoint_path)))
+            logger.info(f"Found checkpoint: {checkpoint_name}")
+        else:
+            logger.warning(f"Checkpoint not found: {checkpoint_name}, skipping...")
+
+    if not checkpoints:
+        raise ValueError(f"No checkpoints found in {checkpoint_base} for the given task sequence")
+
+    return checkpoints
 
 
 def validate_base_model(

@@ -5,10 +5,10 @@ import json
 from pathlib import Path
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
-import sys
-sys.path.insert(0, '/storage/ice1/0/5/kmadaswar3/smr_project')
-from validate import find_checkpoints
-from constants import BASE_MODEL
+# import sys
+# sys.path.insert(0, '/storage/ice1/0/5/kmadaswar3/smr_project')
+from src.validate import find_checkpoints
+from src.constants import BASE_MODEL
 
 
 def get_quantization_config(bits):

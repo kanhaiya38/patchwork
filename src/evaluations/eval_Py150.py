@@ -1,6 +1,6 @@
 import re
 import json
-from metrics import caculate_fuzz
+from src.metrics import caculate_fuzz
 
 
 def postprocess(code):
