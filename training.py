@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
 import torch
-from constants import MAX_PROMPT_LEN, MAX_ANS_LEN, DEFAULT_TASK_CONFIGS
+from constants import MAX_PROMPT_LEN, MAX_ANS_LEN, DEFAULT_TASK_CONFIGS, BASE_MODEL
 from data_collator import DataCollator
 from datasets import load_dataset, load_from_disk, concatenate_datasets, Dataset
 from peft import PeftModel, LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -311,7 +311,7 @@ class ContinualLearningTrainer:
 
     def __init__(
         self,
-        base_model_name: str = "openlm-research/open_llama_3b_v2",
+        base_model_name: str = BASE_MODEL,
         output_base_dir: str = "./experiments",
         data_dir: str = "TRACE-Benchmark/LLM-CL-Benchmark_5000",
         max_prompt_len: int = MAX_PROMPT_LEN,
@@ -1443,7 +1443,7 @@ Examples:
     trainer = ContinualLearningTrainer(
         output_base_dir=args.output_base_dir,
         data_dir=args.data_dir,
-        base_model_name="merged-openllama-3b",
+        base_model_name=BASE_MODEL,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         use_experience_replay=not args.no_replay,

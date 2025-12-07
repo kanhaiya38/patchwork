@@ -5,3 +5,6 @@ lora-output
 model-update-1
 TRACE-Benchmark
 validation-results
+.cache
+experiments
+TRACE-Benchmark.zip

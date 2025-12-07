@@ -1,7 +1,6 @@
 import logging
 import torch
 from transformers.data.data_collator import *
-from inference.ICL import TASK_PROMT, Constrained_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +16,6 @@ class DataCollator:
     label_pad_token_id: int = -100
     return_tensors: str = "pt"
     inference: bool = False
-    demonstrations: Optional[Any] = None
     task: str = None
 
     def __call__(self, batch, return_tensors=None):
@@ -80,23 +78,6 @@ class DataCollator:
                 label_lens.append(len(tokenized_label["input_ids"]))
                 tokenized_sources.append(tokenize_source)
             else:
-                if self.demonstrations!=None:
-                    task_prompt = ""
-                    task_prompt += TASK_PROMT[self.task]
-                    if self.task!="MeetingBank": #MeetingBank不给例子
-                        task_prompt += Constrained_PROMPT
-                    for demonstration in self.demonstrations:
-                        if self.task=="Py150":
-                            task_prompt+= "Code:\n"
-                        task_prompt+=demonstration["prompt"]
-                        task_prompt+=demonstration["answer"]+"\n\n"
-                    
-                    if self.task=="Py150":
-                        task_prompt+= "Code:\n"
-                    # task_prompt += Constrained_PROMPT
-                    if self.task!="Py150": #Py150不带prompt
-                        instruction = instruction[len(TASK_PROMT[self.task]):]
-                    instruction = task_prompt+instruction
                 tokenize_source = self.tokenize(instruction, limit_len, add_bos_token=True, add_eos_token=False)
                 tokenized_sources.append(tokenize_source)
 
