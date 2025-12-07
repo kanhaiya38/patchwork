@@ -82,11 +82,11 @@ def load_base_model(
     device: str = "cuda"
 ):
     """
-    Load the base model without any LoRA adapters (same config as training.py).
+    Load the base model without any LoRA adapters.
 
     Args:
         base_model_name: Base model identifier
-        use_quantization: Whether to use 4-bit quantization (same as training)
+        use_quantization: Whether to use 4-bit quantization
         device: Device to load model on
 
     Returns:
@@ -94,7 +94,7 @@ def load_base_model(
     """
     logger.info(f"Loading base model: {base_model_name}")
 
-    # Configure quantization (same as training.py)
+    # Configure quantization
     bnb_config = None
     if use_quantization:
         bnb_config = BitsAndBytesConfig(
@@ -109,7 +109,7 @@ def load_base_model(
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    # Load base model (same as training.py)
+    # Load base model
     model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
         quantization_config=bnb_config,
@@ -139,7 +139,7 @@ def load_model_from_checkpoint(
     Args:
         checkpoint_path: Path to the checkpoint (merged model or LoRA adapter)
         base_model_name: Base model identifier (only used when USE_MERGED_MODELS=False)
-        use_quantization: Whether to use 4-bit quantization (same as training)
+        use_quantization: Whether to use 4-bit quantization
         pre_quantized: If True, models are already quantized (don't apply quantization_config)
         device: Device to load model on
 
@@ -193,7 +193,7 @@ def load_model_from_checkpoint(
         # OLD: Load base model + LoRA adapter (existing behavior)
         logger.info(f"Loading base model: {base_model_name}")
 
-        # Configure quantization (same as training.py)
+        # Configure quantization
         bnb_config = None
         if use_quantization:
             bnb_config = BitsAndBytesConfig(
@@ -208,7 +208,7 @@ def load_model_from_checkpoint(
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
-        # Load base model (same as training.py)
+        # Load base model
         base_model = AutoModelForCausalLM.from_pretrained(
             base_model_name,
             quantization_config=bnb_config,
