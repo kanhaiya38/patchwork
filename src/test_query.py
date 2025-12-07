@@ -6,10 +6,7 @@ Test your checkpointed model with custom queries.
 Usage:
     # Test a checkpoint
     python test_query.py --checkpoint ./lora-continual/task_0_C-STANCE
-
-    # Test base model
-    python test_query.py --base-model
-
+    
     # Single query (non-interactive)
     python test_query.py --checkpoint ./lora-continual/task_0_C-STANCE --query "Your question here"
 """
@@ -46,10 +43,8 @@ def generate(model, tokenizer, query, max_tokens=MAX_ANS_LEN, temperature=0.1):
             use_cache=True
         )
 
-    # Decode full output
     full_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-    # Decode generated part only
     generated_text = tokenizer.decode(outputs[0][prompt_len:], skip_special_tokens=True)
 
     return full_text, generated_text

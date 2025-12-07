@@ -2,38 +2,9 @@
 Full Model Fine-Tuning for Continual Learning
 
 This script performs full fine-tuning where ALL model parameters are trained.
-Compare with training.py which uses LoRA (parameter-efficient fine-tuning).
-
-Key Differences from training.py:
-- Full fine-tuning: All model parameters are trained (~3B parameters for OpenLLaMA-3B)
-- LoRA (training.py): Only adapter parameters trained (~2-4M parameters)
-
-Performance vs Memory Trade-off:
-- Full fine-tuning: Potentially better performance, requires more VRAM
-- LoRA: Faster training, less memory, slightly lower performance
-
-Checkpoint Sizes:
-- Full fine-tuning: ~6GB for 3B model (stores entire model)
-- LoRA: ~20MB (stores only adapter weights)
 
 Usage:
-    # Full fine-tuning without quantization (requires large GPU like H200)
     python training_full.py --task MeetingBank --task FOMC
-
-    # Full fine-tuning with 4-bit quantization (saves memory)
-    python training_full.py --task MeetingBank --task FOMC --quantize
-
-    # Auto-resume from last checkpoint
-    python training_full.py --task MeetingBank --task FOMC
-
-    # Start fresh (ignore existing checkpoints)
-    python training_full.py --task MeetingBank --task FOMC --no-resume
-
-    # Custom replay configuration
-    python training_full.py --task MeetingBank --task FOMC --replay-samples-per-task 1000
-
-    # Disable experience replay (not recommended)
-    python training_full.py --task MeetingBank --task FOMC --no-replay
 """
 
 import argparse
@@ -291,21 +262,6 @@ def main():
 Examples:
   # Full fine-tuning with auto-resume and experience replay (default)
   python training_full.py --task MeetingBank --task FOMC
-
-  # With 4-bit quantization to save memory
-  python training_full.py --task MeetingBank --task FOMC --quantize
-
-  # Start fresh, ignoring existing checkpoints
-  python training_full.py --task MeetingBank --task FOMC --no-resume
-
-  # Custom output directory
-  python training_full.py --task MeetingBank --task FOMC --output-base-dir ./my-full-experiment
-
-  # Disable experience replay (not recommended)
-  python training_full.py --task MeetingBank --task FOMC --no-replay
-
-  # Custom replay configuration (store more samples per task)
-  python training_full.py --task MeetingBank --task FOMC --replay-samples-per-task 1000
         """,
     )
 
@@ -377,11 +333,9 @@ Examples:
 
     args = parser.parse_args()
 
-    # Build task list from arguments
     tasks = []
     for name in args.task:
         cfg = DEFAULT_TASK_CONFIGS[name]
-        # Use num_epochs instead of batch_size for max_batch_size
         tasks.append(Task(dataset_name=name, num_epochs=cfg['num_epochs'], max_batch_size=cfg.get('batch_size')))
 
     logger.info("=" * 80)
@@ -407,7 +361,7 @@ Examples:
         logger.info(f"  - Growth: Task dataset increases by ~{args.replay_samples_per_task} samples per task")
     else:
         logger.info(f"Experience Replay: DISABLED")
-        logger.info(f"  ⚠️  Warning: Catastrophic forgetting will be higher without replay!")
+        logger.info(f"    ️  Warning: Catastrophic forgetting will be higher without replay!")
     logger.info("=" * 80)
 
     # Initialize trainer

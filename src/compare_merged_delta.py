@@ -36,17 +36,35 @@ def get_quantization_config(bits):
         raise ValueError(f"Unsupported bits: {bits}. Only 4 and 8 are supported.")
 
 
-def load_model(model_path, quantization_bits=None):
+def load_model(model_path, quantization_bits=None, quantized_model_dir=None):
     """
     Load a model with optional quantization.
 
     Args:
         model_path: Path to the model
         quantization_bits: None for no quantization, 4 or 8 for quantized loading
+        quantized_model_dir: Directory containing pre-quantized models (optional)
 
     Returns:
         Loaded model
     """
+    # Check if we should use a pre-quantized model
+    if quantization_bits and quantized_model_dir:
+        # Extract model name from path and construct quantized model path
+        model_name = Path(model_path).name
+        quantized_path = Path(quantized_model_dir) / model_name
+
+        if quantized_path.exists():
+            print(f"  Loading pre-quantized {quantization_bits}-bit model from {quantized_path}...")
+            model = AutoModelForCausalLM.from_pretrained(
+                str(quantized_path),
+                device_map="auto"
+            )
+            return model
+        else:
+            print(f"  Pre-quantized model not found at {quantized_path}, falling back to on-the-fly quantization...")
+
+    # Original loading logic (on-the-fly quantization or no quantization)
     if quantization_bits:
         print(f"  Loading with {quantization_bits}-bit quantization...")
         quantization_config = get_quantization_config(quantization_bits)
@@ -121,7 +139,7 @@ def calculate_delta_nonzero_weights(base_model, merged_model):
     return (float(total_nonzero) / float(total_weights)) * 100
 
 
-def run_comparison(base_model_name, merged_model_path, quantization_bits=None):
+def run_comparison(base_model_name, merged_model_path, quantization_bits=None, quantized_model_dir=None):
     """
     Run a single comparison between base and merged models with optional quantization.
 
@@ -129,6 +147,7 @@ def run_comparison(base_model_name, merged_model_path, quantization_bits=None):
         base_model_name: Name or path of the base model
         merged_model_path: Path to the merged model
         quantization_bits: None for no quantization, 4 or 8 for quantized comparison
+        quantized_model_dir: Directory containing pre-quantized models (optional)
 
     Returns:
         float: Delta percentage
@@ -143,18 +162,20 @@ def run_comparison(base_model_name, merged_model_path, quantization_bits=None):
     print(f"Base model: {base_model_name}")
     print(f"Merged model: {merged_model_path}")
     print(f"Quantization: {quantization_label}")
+    if quantized_model_dir:
+        print(f"Pre-quantized model directory: {quantized_model_dir}")
     print("=" * 80 + "\n")
 
     # Load base model
     print("Loading base model...")
     start_time = time.time()
-    base_model = load_model(base_model_name, quantization_bits)
+    base_model = load_model(base_model_name, quantization_bits, quantized_model_dir)
     print(f"Base model loaded in {time.time() - start_time:.2f}s\n")
 
     # Load merged model
     print("Loading merged model...")
     start_time = time.time()
-    merged_model = load_model(merged_model_path, quantization_bits)
+    merged_model = load_model(merged_model_path, quantization_bits, quantized_model_dir)
     print(f"Merged model loaded in {time.time() - start_time:.2f}s\n")
 
     # Calculate delta
@@ -190,7 +211,7 @@ def run_comparison(base_model_name, merged_model_path, quantization_bits=None):
     return delta_percentage
 
 
-def run_checkpoint_comparison(checkpoint1_path, checkpoint2_path, quantization_bits, label):
+def run_checkpoint_comparison(checkpoint1_path, checkpoint2_path, quantization_bits, label, quantized_model_dir=None):
     """
     Compare two checkpoints directly (e.g., sequential task comparisons).
 
@@ -199,6 +220,7 @@ def run_checkpoint_comparison(checkpoint1_path, checkpoint2_path, quantization_b
         checkpoint2_path: Path to the second checkpoint
         quantization_bits: None for no quantization, 4 or 8 for quantized comparison
         label: Descriptive label for this comparison (e.g., "task_1 vs task_0")
+        quantized_model_dir: Directory containing pre-quantized models (optional)
 
     Returns:
         float: Delta percentage
@@ -210,18 +232,20 @@ def run_checkpoint_comparison(checkpoint1_path, checkpoint2_path, quantization_b
     print(f"Checkpoint 1: {checkpoint1_path}")
     print(f"Checkpoint 2: {checkpoint2_path}")
     print(f"Quantization: {quantization_label}")
+    if quantized_model_dir:
+        print(f"Pre-quantized model directory: {quantized_model_dir}")
     print("=" * 80 + "\n")
 
     # Load first checkpoint
     print("Loading checkpoint 1...")
     start_time = time.time()
-    checkpoint1 = load_model(checkpoint1_path, quantization_bits)
+    checkpoint1 = load_model(checkpoint1_path, quantization_bits, quantized_model_dir)
     print(f"Checkpoint 1 loaded in {time.time() - start_time:.2f}s\n")
 
     # Load second checkpoint
     print("Loading checkpoint 2...")
     start_time = time.time()
-    checkpoint2 = load_model(checkpoint2_path, quantization_bits)
+    checkpoint2 = load_model(checkpoint2_path, quantization_bits, quantized_model_dir)
     print(f"Checkpoint 2 loaded in {time.time() - start_time:.2f}s\n")
 
     # Calculate delta
@@ -246,7 +270,7 @@ def run_checkpoint_comparison(checkpoint1_path, checkpoint2_path, quantization_b
     return delta_percentage
 
 
-def run_continual_learning_comparison(base_model_name, checkpoints, quantization_bits, comparison_mode):
+def run_continual_learning_comparison(base_model_name, checkpoints, quantization_bits, comparison_mode, quantized_model_dir=None):
     """
     Run delta comparisons for continual learning checkpoints.
 
@@ -255,6 +279,7 @@ def run_continual_learning_comparison(base_model_name, checkpoints, quantization
         checkpoints: List of tuples [(task_id, task_name, checkpoint_path), ...]
         quantization_bits: None for no quantization, 4 or 8 for quantized comparison
         comparison_mode: "cumulative", "sequential", or "both"
+        quantized_model_dir: Directory containing pre-quantized models (optional)
 
     Returns:
         Dictionary containing results for cumulative and/or sequential comparisons
@@ -275,7 +300,7 @@ def run_continual_learning_comparison(base_model_name, checkpoints, quantization
                 print(f"Comparing: {checkpoint_name} vs Base Model")
                 print(f"{'='*80}\n")
 
-                delta = run_comparison(base_model_name, checkpoint_path, quantization_bits)
+                delta = run_comparison(base_model_name, checkpoint_path, quantization_bits, quantized_model_dir)
                 results["cumulative"][checkpoint_name] = {
                     "delta_percentage": delta,
                     "quantization": quantization_label,
@@ -318,7 +343,8 @@ def run_continual_learning_comparison(base_model_name, checkpoints, quantization
                     prev_checkpoint_path,
                     curr_checkpoint_path,
                     quantization_bits,
-                    comparison_label
+                    comparison_label,
+                    quantized_model_dir
                 )
 
                 results["sequential"][comparison_label] = {
@@ -394,6 +420,12 @@ Examples:
         default=BASE_MODEL,
         help=f"Base model name or path (default: {BASE_MODEL})"
     )
+    parser.add_argument(
+        "--quantized-model-dir",
+        type=str,
+        default=None,
+        help="Directory containing pre-quantized models (optional). If provided, will use pre-quantized models when available."
+    )
 
     args = parser.parse_args()
 
@@ -454,7 +486,8 @@ Examples:
                 base_model_name,
                 checkpoints,
                 quant_bits,
-                comparison_mode
+                comparison_mode,
+                args.quantized_model_dir
             )
             all_results[quant_label] = results
         except Exception as e:

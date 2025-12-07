@@ -16,7 +16,6 @@ from datasets import Dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Add src to path for evaluation modules
 # sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from src.evaluations import (
     eval_ScienceQA,

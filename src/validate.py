@@ -126,6 +126,7 @@ def load_model_from_checkpoint(
     checkpoint_path: str,
     base_model_name: str = "openlm-research/open_llama_3b_v2",
     use_quantization: bool = False,
+    pre_quantized: bool = False,
     device: str = "cuda"
 ):
     """
@@ -139,6 +140,7 @@ def load_model_from_checkpoint(
         checkpoint_path: Path to the checkpoint (merged model or LoRA adapter)
         base_model_name: Base model identifier (only used when USE_MERGED_MODELS=False)
         use_quantization: Whether to use 4-bit quantization (same as training)
+        pre_quantized: If True, models are already quantized (don't apply quantization_config)
         device: Device to load model on
 
     Returns:
@@ -150,13 +152,15 @@ def load_model_from_checkpoint(
 
         # Configure quantization
         bnb_config = None
-        if use_quantization:
+        if use_quantization and not pre_quantized:
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_use_double_quant=True,
             )
+        elif pre_quantized:
+            logger.info("Loading pre-quantized model (skipping quantization config)")
 
         # Load tokenizer from merged model directory
         tokenizer = AutoTokenizer.from_pretrained(checkpoint_path, use_fast=False)
@@ -164,12 +168,22 @@ def load_model_from_checkpoint(
         tokenizer.padding_side = "left"
 
         # Load merged model directly (no LoRA adapter needed)
-        model = AutoModelForCausalLM.from_pretrained(
-            str(checkpoint_path),
-            quantization_config=bnb_config,
-            device_map="auto",
-            trust_remote_code=True,
-        )
+        if pre_quantized:
+            # For pre-quantized models, load without specifying quantization_config
+            # The model is already quantized, so we just load it as-is
+            model = AutoModelForCausalLM.from_pretrained(
+                str(checkpoint_path),
+                device_map="auto",
+                trust_remote_code=True,
+                low_cpu_mem_usage=True
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                str(checkpoint_path),
+                quantization_config=bnb_config,
+                device_map="auto",
+                trust_remote_code=True,
+            )
         model.eval()
 
         logger.info("Merged model loaded successfully")
@@ -340,7 +354,7 @@ def validate_base_model(
         max_ans_len=max_ans_len,
         pad_to_multiple_of=1,
         inference=True,
-        task=dataset_name  # Pass task name for dataset-specific handling
+        task=dataset_name
     )
     eval_sampler = SequentialSampler(dataset["eval"])
     eval_dataloader = DataLoader(
@@ -382,6 +396,7 @@ def validate_checkpoint(
     temperature: float = 0.1,
     batch_size: int = 4,
     use_quantization: bool = False,
+    pre_quantized: bool = False,
     device: str = "cuda"
 ):
     """
@@ -398,6 +413,7 @@ def validate_checkpoint(
         temperature: Generation temperature
         batch_size: Batch size for inference
         use_quantization: Whether to use 4-bit quantization
+        pre_quantized: If True, models are already quantized
         device: Device to run on
     """
     logger.info("=" * 80)
@@ -410,6 +426,7 @@ def validate_checkpoint(
         checkpoint_path=checkpoint_path,
         base_model_name=base_model_name,
         use_quantization=use_quantization,
+        pre_quantized=pre_quantized,
         device=device
     )
 
@@ -493,10 +510,15 @@ def validate_all_checkpoints(
     # Resolve checkpoint base directory based on USE_MERGED_MODELS
     if USE_MERGED_MODELS:
         # Convert to merged_models directory
-        if "lora-continual" in checkpoint_base_dir or "continual" in checkpoint_base_dir:
-            checkpoint_base = Path(checkpoint_base_dir).parent / "merged_models"
+        checkpoint_path = Path(checkpoint_base_dir)
+
+        # Check if path already points to a models directory
+        if checkpoint_path.name in ["merged_models", "quantized_models", "quantized-models"]:
+            checkpoint_base = checkpoint_path
+        elif "lora-continual" in checkpoint_base_dir or "continual" in checkpoint_base_dir:
+            checkpoint_base = checkpoint_path.parent / "merged_models"
         else:
-            checkpoint_base = Path(checkpoint_base_dir) / "merged_models"
+            checkpoint_base = checkpoint_path / "merged_models"
         logger.info(f"Using merged models directory: {checkpoint_base}")
     else:
         checkpoint_base = Path(checkpoint_base_dir)
@@ -844,10 +866,15 @@ def validate_all_on_single_dataset(
     # Resolve checkpoint base directory based on USE_MERGED_MODELS
     if USE_MERGED_MODELS:
         # Convert to merged_models directory
-        if "lora-continual" in checkpoint_base_dir or "continual" in checkpoint_base_dir:
-            checkpoint_base = Path(checkpoint_base_dir).parent / "merged_models"
+        checkpoint_path = Path(checkpoint_base_dir)
+
+        # Check if path already points to a models directory
+        if checkpoint_path.name in ["merged_models", "quantized_models", "quantized-models"]:
+            checkpoint_base = checkpoint_path
+        elif "lora-continual" in checkpoint_base_dir or "continual" in checkpoint_base_dir:
+            checkpoint_base = checkpoint_path.parent / "merged_models"
         else:
-            checkpoint_base = Path(checkpoint_base_dir) / "merged_models"
+            checkpoint_base = checkpoint_path / "merged_models"
         logger.info(f"Using merged models directory: {checkpoint_base}")
     else:
         checkpoint_base = Path(checkpoint_base_dir)
@@ -964,32 +991,6 @@ Examples:
   # Each checkpoint is tested on its current task + all previous tasks
   # Also evaluates base model on all datasets and computes forgetting metrics
   python validate.py --validate-all ./lora-continual
-
-  # Same as above but exclude base model evaluation
-  python validate.py --validate-all ./lora-continual --no-base-model
-
-  # Disable continual learning mode (old behavior: each checkpoint on own dataset only)
-  python validate.py --validate-all ./lora-continual --no-continual-learning
-
-  # SINGLE CHECKPOINT VALIDATION
-  # Validate a specific checkpoint on current + all previous tasks (continual learning mode, default)
-  python validate.py --checkpoint-dir ./lora-continual/task_2_MeetingBank
-
-  # Validate a checkpoint only on its training dataset (disable continual learning)
-  python validate.py --checkpoint-dir ./lora-continual/task_2_MeetingBank --no-continual-learning
-
-  # Validate a checkpoint on a specific dataset only
-  python validate.py --checkpoint-dir ./lora-continual/task_2_MeetingBank --dataset ScienceQA
-
-  # SINGLE DATASET EVALUATION
-  # Evaluate all checkpoints + base model on a single dataset (measure forgetting)
-  python validate.py --eval-all-on-dataset MeetingBank
-
-  # Evaluate all checkpoints on a single dataset (exclude base model)
-  python validate.py --eval-all-on-dataset MeetingBank --no-base-model
-
-  # Evaluate only the base model on a dataset
-  python validate.py --eval-base-model MeetingBank
         """
     )
 
@@ -1070,6 +1071,11 @@ Examples:
         action="store_true",
         help="Enable 4-bit quantization (default: disabled)"
     )
+    parser.add_argument(
+        "--pre-quantized",
+        action="store_true",
+        help="Models are already quantized (don't apply quantization config during loading)"
+    )
 
     # Generation settings
     parser.add_argument(
@@ -1111,22 +1117,17 @@ Examples:
     base_output_dir = args.output_dir
 
     if args.validate_all:
-        # For validate-all mode: ./validation-results/all_checkpoints_TIMESTAMP
         output_dir = Path(base_output_dir) / f"all_checkpoints_{timestamp}"
     elif args.eval_all_on_dataset:
-        # For eval-all-on-dataset mode: ./validation-results/DATASET_TIMESTAMP
         output_dir = Path(base_output_dir) / f"{args.eval_all_on_dataset}_{timestamp}"
     elif args.eval_base_model:
-        # For eval-base-model mode: ./validation-results/base_model_DATASET_TIMESTAMP
         output_dir = Path(base_output_dir) / f"base_model_{args.eval_base_model}_{timestamp}"
     else:
-        # For single checkpoint mode: ./validation-results/CHECKPOINT_NAME_TIMESTAMP
         checkpoint_name = Path(args.checkpoint_dir).name
         output_dir = Path(base_output_dir) / f"{checkpoint_name}_{timestamp}"
 
     logger.info(f"Output directory: {output_dir}")
 
-    # Common kwargs
     common_kwargs = {
         "data_dir": args.data_dir,
         "output_dir": str(output_dir),
@@ -1134,6 +1135,7 @@ Examples:
         "temperature": args.temperature,
         "batch_size": args.batch_size,
         "use_quantization": use_quantization,
+        "pre_quantized": args.pre_quantized,
         "device": "cuda" if torch.cuda.is_available() else "cpu"
     }
 
@@ -1162,7 +1164,6 @@ Examples:
         checkpoint_path_input = Path(args.checkpoint_dir)
         checkpoint_name = checkpoint_path_input.name
 
-        # Resolve checkpoint path based on USE_MERGED_MODELS
         if USE_MERGED_MODELS:
             # Convert path to merged_models directory
             checkpoint_dir_str = str(checkpoint_path_input)

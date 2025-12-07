@@ -93,7 +93,7 @@ class ExperienceReplayBuffer:
         }
 
         logger.info(
-            f"✓ Registered task {task_id} ({dataset_name}) for replay buffer"
+            f"  Registered task {task_id} ({dataset_name}) for replay buffer"
         )
         logger.info(
             f"  Replay buffer now tracks {len(self.task_info)} completed task(s)"
@@ -182,11 +182,11 @@ class ExperienceReplayBuffer:
                     selected = formatted.select(indices)
 
                 replay_datasets.append(selected)
-                logger.info(f"    ✓ Sampled {num_samples} examples from Task {prev_task_id}")
+                logger.info(f"      Sampled {num_samples} examples from Task {prev_task_id}")
 
             except Exception as e:
                 logger.error(
-                    f"    ✗ Failed to load dataset {dataset_name} for replay: {e}"
+                    f"      Failed to load dataset {dataset_name} for replay: {e}"
                 )
                 logger.error(f"    Skipping Task {prev_task_id} from replay buffer")
                 continue
@@ -201,7 +201,7 @@ class ExperienceReplayBuffer:
         combined = concatenate_datasets(replay_datasets)
 
         logger.info("=" * 80)
-        logger.info(f"✓ REPLAY BUFFER READY")
+        logger.info(f"  REPLAY BUFFER READY")
         logger.info(f"  Total samples: {len(combined)} from {len(replay_datasets)} task(s)")
         logger.info(f"  Breakdown: {', '.join([f'Task {i}: {len(ds)}' for i, ds in enumerate(replay_datasets)])}")
         logger.info("=" * 80)
@@ -226,7 +226,7 @@ class ExperienceReplayBuffer:
         with open(metadata_path, "wb") as f:
             pickle.dump(metadata, f)
 
-        logger.info(f"✓ Replay buffer metadata saved to {path}")
+        logger.info(f"  Replay buffer metadata saved to {path}")
         logger.info(f"  Tracks {len(self.task_info)} completed task(s)")
 
     @classmethod
@@ -259,7 +259,7 @@ class ExperienceReplayBuffer:
             buffer.task_info = metadata["task_info"]
 
             logger.info(
-                f"✓ Replay buffer metadata loaded from {path} "
+                f"  Replay buffer metadata loaded from {path} "
                 f"({len(buffer.task_info)} tasks tracked)"
             )
 
@@ -695,7 +695,7 @@ class ContinualLearningTrainer:
             try:
                 tokenized_dataset = load_from_disk(str(cache_path))
                 logger.info(
-                    f"✓ Cached dataset loaded (skipped formatting & tokenization)"
+                    f"  Cached dataset loaded (skipped formatting & tokenization)"
                 )
                 return tokenized_dataset
             except Exception as e:
@@ -738,73 +738,6 @@ class ContinualLearningTrainer:
 
         logger.info(f"Dataset {dataset_name} prepared successfully")
         return formatted_dataset
-
-    def data_collator_with_prompt_masking(self, features):
-        """
-        Custom data collator that masks prompt tokens in labels.
-        Dynamically calculates answer length for each example to work with all TRACE datasets.
-
-        Works for any answer length:
-        - Short answers (FOMC: "A" = 1 token)
-        - Long answers (MeetingBank: summaries = 200+ tokens)
-        """
-        # Determine max length for padding
-        max_length = max(len(feature["input_ids"]) for feature in features)
-
-        batch = {"input_ids": [], "attention_mask": [], "labels": []}
-
-        for idx, feature in enumerate(features):
-            input_ids = feature["input_ids"]
-            attention_mask = feature["attention_mask"]
-
-            # Check if 'answer' key exists
-            if "answer" not in feature:
-                logger.error(
-                    f"Feature {idx} missing 'answer' key. Available keys: {list(feature.keys())}"
-                )
-                raise KeyError(
-                    "'answer' field is missing from features. Check dataset processing."
-                )
-
-            answer_text = feature["answer"]
-
-            # Dynamically calculate answer length by tokenizing it
-            # This handles any answer length (from 1 token to 500+ tokens)
-            answer_with_eos = answer_text + self.tokenizer.eos_token
-            tokenized_answer = self.tokenizer(
-                answer_with_eos,
-                add_special_tokens=False,  # Don't add BOS, we only want answer + EOS
-                truncation=False,
-            )
-            answer_length = len(tokenized_answer["input_ids"])
-
-            # Create labels: mask prompt tokens, keep answer tokens
-            # -100 is the ignore index for CrossEntropyLoss
-            prompt_length = len(input_ids) - answer_length
-            if prompt_length < 0:
-                # Safety check: if answer is longer than full sequence, something is wrong
-                logger.warning(
-                    f"Example {idx}: answer_length ({answer_length}) > total_length ({len(input_ids)})"
-                )
-                prompt_length = 0
-
-            labels = [-100] * prompt_length + input_ids[-answer_length:]
-
-            # Pad sequences
-            padding_length = max_length - len(input_ids)
-            if padding_length > 0:
-                input_ids = input_ids + [self.tokenizer.pad_token_id] * padding_length
-                attention_mask = attention_mask + [0] * padding_length
-                labels = labels + [-100] * padding_length
-
-            batch["input_ids"].append(input_ids)
-            batch["attention_mask"].append(attention_mask)
-            batch["labels"].append(labels)
-
-        # Convert to tensors
-        batch = {k: torch.tensor(v) for k, v in batch.items()}
-
-        return batch
 
     def train_model(
         self,
@@ -940,7 +873,7 @@ class ContinualLearningTrainer:
 
         self.model.save_pretrained(str(checkpoint_path))
         self.tokenizer.save_pretrained(str(checkpoint_path))
-        logger.info("✓ LoRA checkpoint saved")
+        logger.info("  LoRA checkpoint saved")
 
         # Step 2: Merge and save merged model (NEW)
         logger.info(f"Merging LoRA into base model for task {task_id}...")
@@ -948,7 +881,7 @@ class ContinualLearningTrainer:
 
         # Step 3: Update base model path for next task (NEW)
         if merged_path:
-            logger.info(f"✓ Merged model saved to {merged_path}")
+            logger.info(f"  Merged model saved to {merged_path}")
             # Update base model path for next task
             self.current_base_model_path = str(merged_path)
             logger.info(
@@ -956,7 +889,7 @@ class ContinualLearningTrainer:
             )
         else:
             logger.warning(
-                f"⚠ Merge failed for task {task_id}. Next task will use "
+                f"   Merge failed for task {task_id}. Next task will use "
                 f"current base: {self.current_base_model_path}"
             )
 
@@ -1006,7 +939,7 @@ class ContinualLearningTrainer:
                 device_map="auto",
                 trust_remote_code=True,
             )
-            logger.info("✓ Base model loaded")
+            logger.info("  Base model loaded")
 
             # Step 2: Load current LoRA adapter
             # Get LoRA checkpoint path for this task
@@ -1019,23 +952,23 @@ class ContinualLearningTrainer:
                 str(lora_checkpoint_path),
                 is_trainable=False,  # Not training, just merging
             )
-            logger.info("✓ LoRA adapter loaded")
+            logger.info("  LoRA adapter loaded")
 
             # Step 3: Merge LoRA weights into base model
             logger.info("Merging LoRA weights into base model...")
             merged_model = model_with_lora.merge_and_unload()
-            logger.info("✓ Merge complete")
+            logger.info("  Merge complete")
 
             # Step 4: Save merged model
             logger.info(f"Saving merged model to {merged_model_path}")
             merged_model_path.mkdir(parents=True, exist_ok=True)
             merged_model.save_pretrained(str(merged_model_path))
-            logger.info("✓ Merged model saved")
+            logger.info("  Merged model saved")
 
             # Step 5: Save tokenizer (copy from current tokenizer)
             logger.info("Saving tokenizer...")
             self.tokenizer.save_pretrained(str(merged_model_path))
-            logger.info("✓ Tokenizer saved")
+            logger.info("  Tokenizer saved")
 
             # Step 6: Clean up GPU memory
             del base_model_for_merge
@@ -1044,7 +977,7 @@ class ContinualLearningTrainer:
             torch.cuda.empty_cache()
 
             logger.info("=" * 80)
-            logger.info(f"✓ MERGE SUCCESSFUL FOR TASK {task_id}")
+            logger.info(f"  MERGE SUCCESSFUL FOR TASK {task_id}")
             logger.info(f"Merged model size: ~6.4GB")
             logger.info(f"This will be the base model for task {task_id + 1}")
             logger.info("=" * 80)
@@ -1053,7 +986,7 @@ class ContinualLearningTrainer:
 
         except Exception as e:
             logger.error("=" * 80)
-            logger.error(f"✗ MERGE FAILED FOR TASK {task_id}")
+            logger.error(f"  MERGE FAILED FOR TASK {task_id}")
             logger.error(f"Error: {type(e).__name__}: {e}")
             logger.error("=" * 80)
             logger.error(
@@ -1236,11 +1169,11 @@ class ContinualLearningTrainer:
                 self.save_checkpoint(task_id, task.dataset_name)
                 self.cleanup_intermediate_checkpoints()
 
-                logger.info(f"✓ Task {task_id} completed successfully")
+                logger.info(f"  Task {task_id} completed successfully")
 
             except Exception as e:
                 logger.error("=" * 80)
-                logger.error(f"✗ Task {task_id} FAILED with error:")
+                logger.error(f"  Task {task_id} FAILED with error:")
                 logger.error(f"{type(e).__name__}: {e}")
                 logger.error("=" * 80)
 
@@ -1357,7 +1290,7 @@ Examples:
     args = parser.parse_args()
 
     # Define all tasks
-    # Note: MeetingBank uses batch_size=8 due to long sequences (200+ tokens)
+    # Note: MeetingBank uses batch_size=32 due to long sequences (200+ tokens)
     # to avoid OOM errors. Other datasets can use the default batch size.
     # H100
     # tasks = [
@@ -1412,7 +1345,7 @@ Examples:
     else:
         logger.info(f"Experience Replay: DISABLED")
         logger.info(
-            f"  ⚠️  Warning: Catastrophic forgetting will be higher without replay!"
+            f"    ️  Warning: Catastrophic forgetting will be higher without replay!"
         )
     logger.info("=" * 80)
 

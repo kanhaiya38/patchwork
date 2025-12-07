@@ -1,8 +1,7 @@
 """
 Model Loading Utilities
 
-Centralized model and tokenizer loading following DRY principle.
-Handles both base models and LoRA checkpoints with consistent configuration.
+Centralized model and tokenizer loading.
 """
 
 import logging
