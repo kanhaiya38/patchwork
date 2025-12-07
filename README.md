@@ -49,6 +49,7 @@ It is recommended to use the provided `environment.yml` without modification to 
 ## Running the Evaluation
 
 After downloading the dataset and configuring the environment, execute the evaluation script:
+Read the `scripts/test.sh` for more information.
 
 ```bash
 bash scripts/test.sh
@@ -59,3 +60,4 @@ This script assumes default dataset paths and environment configuration. If you 
 ## Additional Notes
 
 * A GPU-enabled system is recommended for efficient execution.
+* Tested on CUDA Version 12.9
