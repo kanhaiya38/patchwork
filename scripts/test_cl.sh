@@ -8,8 +8,6 @@ TASK_ARGS="--task MeetingBank --task FOMC --task Py150 --task ScienceQA --task N
 
 # rm -rf .cache
 # rm -rf ./$NAME
-# python -m src.training --output-base-dir ./${NAME} --data-dir TRACE-Benchmark/LLM-CL-Benchmark_5000 --batch-size ${BATCH_SIZE} ${TASK_ARGS}
+python -m src.training --output-base-dir ./${NAME} --data-dir TRACE-Benchmark/LLM-CL-Benchmark_5000 --batch-size ${BATCH_SIZE} ${TASK_ARGS}
 
-# python -m src.validate --validate-all ./${NAME} --no-base-model ${TASK_ARGS}
-# python -m src.quantize_models --input-dir ./experiments/run_final/merged_models --output-dir ./experiments/run_final/quantized_models --quantization 4
-python -m src.validate --validate-all ./${NAME}/quantized_models --no-base-model --pre-quantized ${TASK_ARGS}
+python -m src.validate --validate-all ./${NAME} --no-base-model ${TASK_ARGS}
